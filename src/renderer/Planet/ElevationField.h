@@ -48,6 +48,41 @@
 // float16 is NOT usable here: its 11-bit mantissa gives an 8 m ULP at
 // 8 000 m, which would quantise the Himalayas into terraces.
 //
+// THE RELIEF PLANE -- WHY THE MEAN IS NOT ENOUGH (#318)
+// ----------------------------------------------------
+// The file carries a SECOND uint16 plane after the elevation grid: the
+// per-texel relief, sigma(L_dem), quantised at the same 0.303 m/count as
+// the heights (offset 0, since relief >= 0; the largest height difference
+// on Earth is 8 848.86 - -10 935 = 19 784 m < 65535*0.303 = 19 857 m, so
+// the plane provably never clamps). Its presence is flagged by
+// kDemFlagReliefPlane in the header and by the magic PTDEM002.
+//
+// It exists because the DEM is baked by AREA-AVERAGING the full-resolution
+// ETOPO grid down to 2048x1024, and an area average is a low-pass filter:
+// it preserves the MEAN of each output texel -- which is why the heights
+// validate (land fraction, mean ocean depth, Everest and the Marianas all
+// land correctly) -- but it destroys the SECOND MOMENT, the inter-texel
+// height variance that sigma(L_dem) measures and that the entire fractal
+// continuation below is anchored on. Deriving relief by differencing the
+// already-averaged grid (which is what pre-#318 did, in BuildReliefMap)
+// cannot recover information the averaging discarded: it reads the
+// difference of block MEANS, which for a rough-but-slowly-trending massif
+// like the Khumbu is far smaller than the true point-to-point relief. The
+// symptom was land relief p99 = 473 m against a rock ramp that needs
+// >= 500 m, so bare rock fired on ~1% of land, and a reference-slope
+// median of ~12 deg at the Khumbu where Gabet, Pratt-Sitaula & Burbank
+// (2004), Geology 32(7):629, publish ~30 deg. The mountains were averaged
+// away before the engine ever saw them.
+//
+// So tools/fetch_planet_dem.py computes sigma(L_dem) on the FULL-resolution
+// grid -- the same central-difference RMS relief BuildReliefMap computes,
+// but at the output-texel lag evaluated over every full-resolution cell in
+// the footprint and RMS-aggregated -- and stores it as this plane. The
+// loader reads it verbatim; the averaging never touches it. Old PTDEM001
+// files (no plane) still load, falling back to the suppressed
+// BuildReliefMap relief with a single loud log line, because a suppressed
+// second moment is a wrong planet, not a broken one.
+//
 // FRACTAL CONTINUATION -- AND WHY IT IS INTERPOLATORY
 // ---------------------------------------------------
 // Below the data floor the field continues with Fournier, Fussell &
@@ -57,9 +92,10 @@
 //
 //     sigma(l) = sigma(L_dem) * S(l)
 //
-// and sigma(L_dem) is *measured from the DEM itself* at each point (the
-// local RMS inter-texel height difference), so the Andes get sharp octaves
-// and the abyssal plains stay flat without anyone tuning anything. S is
+// and sigma(L_dem) is *measured from the full-resolution ETOPO grid* per
+// texel and carried in the file (the relief plane above; the local RMS
+// inter-texel height difference), so the Andes get sharp octaves and the
+// abyssal plains stay flat without anyone tuning anything. S is
 // the normalised structure function, S(L_dem) = 1, and the shape of S is
 // the subject of the next section.
 //
@@ -206,10 +242,30 @@ namespace pt::planet {
 inline constexpr double kDemScaleM  = 0.303;
 inline constexpr double kDemOffsetM = -11000.0;
 
+// The relief plane (#318) reuses the height quantisation step but with a
+// zero offset, since relief is a non-negative height difference. The top
+// of the range, 65535*0.303 = 19 857 m, clears the largest possible height
+// difference on Earth (Everest 8 848.86 m minus Challenger Deep -10 935 m
+// = 19 784 m), so the plane provably never clamps -- which matters, because
+// a silent clamp would reintroduce exactly the second-moment suppression
+// this plane exists to fix.
+inline constexpr double kDemReliefScaleM  = kDemScaleM;
+inline constexpr double kDemReliefOffsetM = 0.0;
+
 // On-disk container. 40-byte header, then width*height little-endian
 // uint16 rows north-to-south, columns west-to-east, pixel-centre
-// registered on a plate-carree (equirectangular) grid.
-inline constexpr char kDemMagic[8] = {'P','T','D','E','M','0','0','1'};
+// registered on a plate-carree (equirectangular) grid. PTDEM002 appends a
+// second width*height uint16 plane, the relief (see kDemFlagReliefPlane).
+inline constexpr char kDemMagic[8]   = {'P','T','D','E','M','0','0','2'};
+// PTDEM001 predates the relief plane (#318). Still loaded, with relief
+// derived from the decimated grid as a fallback; see DigitalElevationModel
+// ::Load and the "RELIEF PLANE" section of this file's header comment.
+inline constexpr char kDemMagicV1[8] = {'P','T','D','E','M','0','0','1'};
+
+// Header `flags` bits.
+//   bit 0: a relief plane follows the elevation plane. Set by PTDEM002
+//          bakes; absent from PTDEM001 (whose flags word is always 0).
+inline constexpr std::uint32_t kDemFlagReliefPlane = 1u << 0;
 
 struct DemHeader {
     char          magic[8];
@@ -217,7 +273,7 @@ struct DemHeader {
     std::uint32_t height;
     double        scale_m;
     double        offset_m;
-    std::uint32_t flags;      // 0 today
+    std::uint32_t flags;      // kDemFlagReliefPlane et al.
     std::uint32_t reserved;
 };
 static_assert(sizeof(DemHeader) == 40, "DemHeader must be 40 bytes on disk");
@@ -234,14 +290,23 @@ public:
     std::uint32_t Width()  const noexcept { return width_; }
     std::uint32_t Height() const noexcept { return height_; }
 
+    // True when the relief plane came from the file (PTDEM002), false when
+    // it was derived from the decimated grid as a PTDEM001 fallback. The
+    // caller logs the difference, because a fallback is a suppressed-relief
+    // planet, not a broken one (see the "RELIEF PLANE" header section).
+    bool ReliefFromFile() const noexcept { return relief_from_file_; }
+
     // Bilinear height in metres at geodetic (lat, lon) in radians.
     // Longitude wraps; latitude clamps at the poles.
     double HeightAt(double lat_rad, double lon_rad) const noexcept;
 
     // Height AND the local relief in one bilinear setup. `relief` is
     // sigma(L_dem) in the fractal continuation: the RMS inter-texel height
-    // difference, precomputed per texel at load by central differences and
-    // then bilinearly interpolated here.
+    // difference. For a PTDEM002 file it is read straight from the relief
+    // plane, measured on the full-resolution ETOPO grid before decimation
+    // (#318); for a PTDEM001 file it is derived from the decimated grid by
+    // central differences (BuildReliefMap) -- suppressed, but consistent.
+    // Either way it is bilinearly interpolated here.
     //
     // Interpolating a precomputed map rather than differencing at sample
     // time is not just a speed choice. The continuation's amplitude must be
@@ -258,12 +323,17 @@ public:
 private:
     double Fetch(std::int64_t x, std::int64_t y) const noexcept;
     float  FetchRelief(std::int64_t x, std::int64_t y) const noexcept;
+    // PTDEM001 fallback: derive relief by central-differencing the decimated
+    // grid. This is the pre-#318 path and is known to suppress the relief
+    // second moment (it reads the difference of block means); kept only so a
+    // legacy file still renders.
     void   BuildReliefMap();
 
     std::uint32_t width_  = 0;
     std::uint32_t height_ = 0;
     double        scale_  = kDemScaleM;
     double        offset_ = kDemOffsetM;
+    bool          relief_from_file_ = false;
     std::vector<std::uint16_t> samples_;
     std::vector<float>         relief_;   // metres RMS per texel
 };

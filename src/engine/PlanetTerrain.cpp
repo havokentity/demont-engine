@@ -58,6 +58,15 @@ bool PlanetTerrain::Init(pt::rhi::Device* device, const TerrainConfig& cfg) {
             LOG_INFO("planet: loaded DEM {} ({}x{}, {:.1f} km/texel at the equator)",
                      resolved, dem_.Width(), dem_.Height(),
                      dem_.TexelAngularSize() * pt::planet::kIuggMeanRadius / 1000.0);
+            if (!dem_.ReliefFromFile()) {
+                // A PTDEM001 file: the relief second moment was averaged
+                // away and derived back from the decimated grid, so the
+                // terrain is systematically too smooth (#318). Not fatal,
+                // but not Earth's real roughness either -- say so once.
+                LOG_WARN("planet: DEM has no relief plane (legacy PTDEM001) -- "
+                         "terrain relief is SUPPRESSED. Rebake with:  "
+                         "python3 tools/fetch_planet_dem.py");
+            }
             field_.SetDem(&dem_);
         } else {
             // Loudly, once. A planet with no data is a procedural body, not

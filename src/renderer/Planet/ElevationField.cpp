@@ -54,7 +54,9 @@ constexpr double kUniformRmsScale = 1.7320508075688772;  // sqrt(3)
 
 bool DigitalElevationModel::Load(const std::string& path, std::string& out_error) {
     width_ = height_ = 0;
+    relief_from_file_ = false;
     samples_.clear();
+    relief_.clear();
 
     std::ifstream f(path, std::ios::binary);
     if (!f) { out_error = "cannot open " + path; return false; }
@@ -62,8 +64,10 @@ bool DigitalElevationModel::Load(const std::string& path, std::string& out_error
     DemHeader hdr{};
     f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
     if (!f) { out_error = "short read on header"; return false; }
-    if (std::memcmp(hdr.magic, kDemMagic, sizeof(kDemMagic)) != 0) {
-        out_error = "bad magic (expected PTDEM001)";
+    const bool is_v2 = std::memcmp(hdr.magic, kDemMagic,   sizeof(kDemMagic))   == 0;
+    const bool is_v1 = std::memcmp(hdr.magic, kDemMagicV1, sizeof(kDemMagicV1)) == 0;
+    if (!is_v2 && !is_v1) {
+        out_error = "bad magic (expected PTDEM002 or PTDEM001)";
         return false;
     }
     if (hdr.width < 4 || hdr.height < 2 ||
@@ -86,7 +90,35 @@ bool DigitalElevationModel::Load(const std::string& path, std::string& out_error
     height_ = hdr.height;
     scale_  = hdr.scale_m;
     offset_ = hdr.offset_m;
-    BuildReliefMap();
+
+    // The relief plane (#318). Present iff the file is PTDEM002 AND the flag
+    // is set -- both, so a truncated or mislabelled file falls back rather
+    // than reading elevation bytes as relief. The plane is the same uint16
+    // layout as the heights, decoded relief_m = value * kDemReliefScaleM
+    // (offset 0). Read it verbatim: it was measured on the full-resolution
+    // grid, so the decimation that smooths the heights never touched it.
+    if (is_v2 && (hdr.flags & kDemFlagReliefPlane)) {
+        std::vector<std::uint16_t> packed(count);
+        f.read(reinterpret_cast<char*>(packed.data()),
+               static_cast<std::streamsize>(count * sizeof(std::uint16_t)));
+        if (!f) {
+            samples_.clear();
+            out_error = "short read on relief plane";
+            return false;
+        }
+        relief_.resize(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            relief_[i] = static_cast<float>(
+                static_cast<double>(packed[i]) * kDemReliefScaleM + kDemReliefOffsetM);
+        }
+        relief_from_file_ = true;
+    } else {
+        // Legacy PTDEM001 (or a v2 file that never wrote the plane): derive
+        // relief from the decimated grid. Known to suppress the second
+        // moment -- the caller says so, loudly, once.
+        BuildReliefMap();
+        relief_from_file_ = false;
+    }
     return true;
 }
 
