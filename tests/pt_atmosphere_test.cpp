@@ -64,6 +64,11 @@
 #include <sstream>
 #include <string>
 
+// Header-only constexpr constants (glm is the only transitive include, itself
+// header-only): pins the backstop radius by VALUE below, without a build
+// dependency on the engine this case reads as text. See the last case.
+#include "renderer/Planet/CubedSphere.h"
+
 namespace {
 
 #if defined(_MSC_VER)
@@ -957,13 +962,31 @@ TEST_CASE("the air column ends at the datum, not at the surface it hits") {
 
     // The two constants this case is about have to stay the ones the
     // engine actually pushes, or the 27.7 km above is a story about a
-    // build that no longer exists.  Read out of Engine.cpp rather than
-    // linked, because this target deliberately has no dependencies.
+    // build that no longer exists.  #326 gave the backstop radius one named
+    // home (pt::planet::kBackstopRadius in CubedSphere.h), so the guard is
+    // now in two halves.
+    //
+    // First the VALUE: the backstop sits Challenger Deep (10 935 m) plus a
+    // 65 m margin -- 11 km -- below the WGS-84 semi-minor axis.  Pinned
+    // numerically at COMPILE TIME, so it fails the build if that depth is
+    // ever changed, however the constant is spelled, and cannot rot the way
+    // a text pin can.  Written against literals (not against kEarthMinElevation
+    // itself) so a change to Challenger Deep is caught too, and phrased as
+    // the offset from b so a legitimate change to b carries the backstop with
+    // it.  A micron of tolerance for the two-step rounding in the constant.
+    static_assert(pt::planet::kWgs84B - pt::planet::kBackstopRadius
+                      > 10935.0 + 65.0 - 1e-6 &&
+                  pt::planet::kWgs84B - pt::planet::kBackstopRadius
+                      < 10935.0 + 65.0 + 1e-6,
+                  "the analytic backstop must sit 11 km (Challenger Deep + 65 m) "
+                  "below the WGS-84 semi-minor axis");
+
+    // Second, that the engine actually PUSHES that constant into
+    // planet_ground.w.  Read out of Engine.cpp as text rather than linked,
+    // because this target deliberately has no build dependency on the engine.
     const std::string eng = tighten(PT_ENGINE_CPP_PATH);
     REQUIRE_FALSE(eng.empty());
-    CHECK(countOf(eng,
-        "ground_body_R=pt::planet::kWgs84B+pt::planet::kEarthMinElevation-65.0;")
-          == 1u);
+    CHECK(countOf(eng, "ground_body_R=pt::planet::kBackstopRadius;") == 1u);
     CHECK(countOf(eng,
         "planet_radius_m=static_cast<float>(planet_terrain_->Site().site_radius_m);")
           == 1u);

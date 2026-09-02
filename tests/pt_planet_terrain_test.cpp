@@ -1191,6 +1191,122 @@ TEST_CASE("freeze pins the residency set regardless of the camera") {
     CHECK(tree.Desired() == pinned);
 }
 
+TEST_CASE("#326: the from-orbit cull predicate honours its limb-shift boundary") {
+    // BackstopGapSubPixel IS the whole cull, and its kCullLimbPx boundary is
+    // reached by no committed golden -- their worst-case limb shift is ~0.6 px
+    // -- so the 3-px threshold rested only on manual A/B renders. Pin it here,
+    // in a CI-visible unit test (CI skips the Metal goldens), on both sides of
+    // the boundary and on each degenerate guard. Direction: a shift SMALLER
+    // than the footprint is antialiased away and the chunk is DROPPED (predicate
+    // true); a LARGER shift is a visible silhouette and the chunk is KEPT.
+    const double R    = 6.3e6;      // a backstop radius
+    const double D    = 3.6e7;      // camera geocentric distance (orbit)
+    const double cone = 6.742e-4;   // 40-degree field at 1080p
+    const double limb = std::sqrt(D * D - R * R);   // eye -> limb tangent length
+
+    // A metric/params pair whose limb shift is exactly `shift_px` pixels:
+    // gap = shift_px * cone * limb, so gap / limb = shift_px * cone_spread.
+    auto make = [&](double shift_px) {
+        ChunkMetric m;
+        m.known           = true;
+        m.surface_r_max_m = R + shift_px * cone * limb;
+        LodParams p;
+        p.backstop_radius_m = R;
+        p.planet_center_w   = glm::dvec3(0.0);
+        p.camera_w          = glm::dvec3(0.0, D, 0.0);
+        p.cone_spread       = cone;
+        return std::make_pair(m, p);
+    };
+
+    // Just inside the boundary: a sub-footprint shift is invisible -> DROP.
+    {
+        auto [m, p] = make(kCullLimbPx * 0.99);
+        CHECK(BackstopGapSubPixel(m, p));
+    }
+    // Just outside: a supra-footprint shift is a visible limb -> KEEP.
+    {
+        auto [m, p] = make(kCullLimbPx * 1.01);
+        CHECK_FALSE(BackstopGapSubPixel(m, p));
+    }
+    // Guard -- no backstop to fall back onto: never cull, however small the
+    // nominal shift, or the world holes to the sky.
+    {
+        auto [m, p] = make(kCullLimbPx * 0.5);
+        p.backstop_radius_m = 0.0;
+        CHECK_FALSE(BackstopGapSubPixel(m, p));
+    }
+    // Guard -- surface at or below the backstop (gap <= 0): not a bump the
+    // backstop fails to represent, so keep and let occlusion sort it out.
+    {
+        auto [m, p] = make(kCullLimbPx * 0.5);
+        m.surface_r_max_m = R;             // gap == 0 exactly
+        CHECK_FALSE(BackstopGapSubPixel(m, p));
+        m.surface_r_max_m = R - 1000.0;    // gap < 0
+        CHECK_FALSE(BackstopGapSubPixel(m, p));
+    }
+    // Guard -- camera on/inside the backstop sphere (no limb ahead of the
+    // eye): keep, which is what a ground camera standing on the terrain gets.
+    {
+        auto [m, p] = make(kCullLimbPx * 0.5);
+        p.camera_w = glm::dvec3(0.0, R, 0.0);         // exactly on the limb sphere
+        CHECK_FALSE(BackstopGapSubPixel(m, p));
+        p.camera_w = glm::dvec3(0.0, R * 0.5, 0.0);   // inside it
+        CHECK_FALSE(BackstopGapSubPixel(m, p));
+    }
+}
+
+TEST_CASE("#326: sub-pixel terrain is culled from orbit and kept at the surface") {
+    // The selector must drop terrain the analytic backstop already carries --
+    // from orbit every chunk stands a fixed ~27.7 km above the backstop, but
+    // that height moves the lit disc's limb by well under a pixel, so tracing
+    // the chunks changes no pixel and only costs BLAS traversal. The claim is
+    // a PROPERTY OF THE DESIRED SET: empty from orbit, full at the surface.
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+
+    // The orbital fixture's own cone: a 40-degree field at 1080p, which is
+    // where the ~36 ms this cull recovers was measured.
+    const double cone = 2.0 * std::tan(0.5 * 40.0 * kPi / 180.0) / 1080.0;
+
+    auto converge_desired = [&](const glm::dvec3& cam,
+                                double backstop) -> std::set<ChunkKey> {
+        TerrainQuadtree tree;
+        LodParams p;
+        p.cone_spread       = cone;
+        p.camera_w          = cam;
+        p.planet_center_w   = site.CenterWorld();
+        p.backstop_radius_m = backstop;
+        p.max_level         = 9;
+        p.chunk_budget      = 4096;
+        Converge(tree, field, site, p);
+        REQUIRE(tree.Converged());
+        return tree.Desired();
+    };
+
+    const glm::dvec3 orbit (0.0, 3.0e7, 0.0);   // 30 000 km up
+    const glm::dvec3 ground(0.0, 1.7,   0.0);   // eye height
+
+    // GREEN: with the backstop present, orbit traces NO terrain. The analytic
+    // body carries the whole disc and every chunk is a sub-pixel stand-in.
+    const std::set<ChunkKey> orbit_culled = converge_desired(orbit, kBackstopRadius);
+    CHECK(orbit_culled.empty());
+
+    // RED control: the cull is load-bearing, not vacuous. backstop_radius_m 0
+    // disables it (no backstop to fall back onto), and the SAME orbital camera
+    // then keeps the coarse cover it traced before this fix.
+    const std::set<ChunkKey> orbit_uncts = converge_desired(orbit, 0.0);
+    CHECK(orbit_uncts.size() >= 6u);
+
+    // At the surface the cover is full AND the cull changes nothing: a ground
+    // camera's terrain stands kilometres in front of the backstop across a
+    // 600 km horizon, so nothing is a sub-pixel stand-in and the desired set
+    // is identical whether or not the backstop is there to fall back onto.
+    const std::set<ChunkKey> ground_culled = converge_desired(ground, kBackstopRadius);
+    const std::set<ChunkKey> ground_uncts  = converge_desired(ground, 0.0);
+    CHECK(ground_culled.size() > 6u);          // refined well past the six roots
+    CHECK(ground_culled == ground_uncts);      // the cull never bites at the surface
+}
+
 TEST_CASE("the async baker returns exactly what was requested") {
     ElevationField field = MakeProceduralField();
     const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);

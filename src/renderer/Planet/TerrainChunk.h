@@ -294,6 +294,14 @@ struct TerrainChunkData {
     double h_min_m = 0.0;
     double h_max_m = 0.0;
 
+    // The chunk's greatest surface radius from the planet centre, in metres:
+    // max over the 65x65 vertices of |vertex_world - planet_centre|. This is
+    // the radial height of the chunk's highest point, and the from-orbit cull
+    // (#326) measures it against the analytic backstop the megakernel falls
+    // back to where no chunk is published. A pure function of (key, field,
+    // site) like everything else here, so it carries no clock into the cull.
+    double surface_r_max_m = 0.0;
+
     // Vertex spacing in metres -- the mip-0 footprint the shader compares
     // cone_width against.
     double vertex_spacing_m = 0.0;

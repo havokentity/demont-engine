@@ -84,6 +84,16 @@ inline constexpr double kIuggMeanRadius = 6371008.8;
 inline constexpr double kEarthMinElevation = -10935.0;
 inline constexpr double kEarthMaxElevation = 8848.86;
 
+// Radius of the analytic backstop body the megakernel intersects wherever
+// terrain streaming has published no chunk (Engine.cpp's planet_ground.w
+// when terrain is on). The ellipsoid's semi-minor axis -- the global minimum
+// of the WGS-84 surface -- minus Challenger Deep and a further 65 m, so the
+// sphere sits inside every terrain vertex at every latitude and a streaming
+// gap shows an opaque planet rather than a hole to the sky. Named here, in
+// one place, because BOTH the shader upload (Engine.cpp) and the from-orbit
+// terrain cull (TerrainQuadtree, #326) measure against it and must not drift.
+inline constexpr double kBackstopRadius = kWgs84B + kEarthMinElevation - 65.0;
+
 // --- Chunk grid geometry --------------------------------------------------
 inline constexpr int kChunkQuads   = 64;                 // cells per edge
 inline constexpr int kChunkVerts   = kChunkQuads + 1;    // 65

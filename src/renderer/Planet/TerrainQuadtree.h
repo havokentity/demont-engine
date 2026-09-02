@@ -105,6 +105,27 @@ struct LodParams {
     // r_planet_lod_freeze: hold the residency set exactly as it is, so a
     // golden capture is not a function of wall clock.
     bool   freeze = false;
+
+    // --- FROM-ORBIT CULL (#326) -------------------------------------------
+    //
+    // From orbit the whole illuminated disc is the analytic backstop body
+    // plus the land-cover raster (Engine.cpp's planet_ground.w, the sphere at
+    // WGS-84 b + Challenger Deep, ~27.7 km below sea level). The streamed
+    // terrain stands ~27.7 km ABOVE that backstop, but from 30 000 km the
+    // only place that height can show is the disc's silhouette at the limb --
+    // and there it moves the edge by well under a pixel. So every terrain
+    // chunk is a pixel-identical stand-in for the backstop behind it, yet
+    // tracing them costs ~36 ms of BLAS traversal a frame. The cull drops
+    // them from the traced set (see BackstopGapSubPixel in the .cpp).
+    //
+    // backstop_radius_m: radius, from the planet centre, of that backstop.
+    // Zero disables the cull -- with no backstop a cull would hole the world
+    // to the sky, so a scene with terrain but no backstop keeps every chunk.
+    double     backstop_radius_m = 0.0;
+    // planet_center_w: the body centre in the same canonical frame as
+    // camera_w, so the cull can form the camera's geocentric distance and
+    // hence the tangent distance to the backstop's limb.
+    glm::dvec3 planet_center_w{0.0};
 };
 
 // What the selector knows about a node it has seen baked.
@@ -112,8 +133,30 @@ struct ChunkMetric {
     double     e_l_m = 0.0;
     glm::dvec3 center_w{0.0};
     double     radius_m = 0.0;
+    // Greatest surface radius from the planet centre (TerrainChunkData::
+    // surface_r_max_m). The from-orbit cull measures this against
+    // LodParams::backstop_radius_m.
+    double     surface_r_max_m = 0.0;
     bool       known = false;
 };
+
+// --- FROM-ORBIT CULL (#326) -----------------------------------------------
+//
+// The from-orbit cull threshold, in pixels of disc-limb shift. See
+// BackstopGapSubPixel and its full derivation in the .cpp for why the disc's
+// limb silhouette -- and not a per-chunk projected size -- is the right
+// measure, and why 3 sits inside the measured-invisible band. Exposed so the
+// boundary test can construct inputs on either side of it.
+inline constexpr double kCullLimbPx = 3.0;
+
+// True when drawing this chunk instead of the analytic backstop would move
+// the lit disc's limb by less than kCullLimbPx pixels -- i.e. the chunk is a
+// pixel-identical stand-in for the backstop and may be dropped from the
+// desired set. A pure function of (metric, params): backstop_radius_m == 0,
+// gap <= 0, or a camera at/below the backstop all return false (keep). The
+// selector's Descend applies it at every leaf; the #326 boundary test pins
+// it directly.
+bool BackstopGapSubPixel(const ChunkMetric& m, const LodParams& p) noexcept;
 
 class TerrainQuadtree {
 public:
