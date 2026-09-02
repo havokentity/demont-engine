@@ -46,9 +46,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <set>
+#include <string>
 #include <utility>
 #include <thread>
 #include <vector>
@@ -474,6 +477,224 @@ TEST_CASE("the elevation field agrees across a cube seam") {
         }
     }
     CHECK(checked > 0);
+}
+
+// --- The relief plane: the second moment area-averaging destroys (#318) ----
+
+namespace {
+
+// A deterministic, non-periodic per-cell roughness in metres. Non-periodic
+// matters: the relief formula is a fixed-lag central difference, so anything
+// periodic at that lag is invisible to it -- this roughness has genuine
+// point-to-point difference at the lag, so it is real relief, while its
+// footprint MEAN is ~flat, so the area average throws it away. That
+// asymmetry (real relief, zero mean) is the whole of #318, distilled.
+double FixtureRough(int x, int y) {
+    std::uint32_t h = static_cast<std::uint32_t>(x) * 0x9e3779b9u
+                    ^ static_cast<std::uint32_t>(y + 1) * 0x85ebca6bu;
+    h ^= h >> 16; h *= 0x7feb352du;
+    h ^= h >> 15; h *= 0x846ca68bu;
+    h ^= h >> 16;
+    const double u = static_cast<double>(h >> 8) * (1.0 / 16777216.0);  // [0,1)
+    return (u - 0.5) * 2.0 * 2000.0;                                    // +-2000 m
+}
+
+std::uint16_t QuantAffine(double m, double scale, double offset) {
+    const double q = std::round((m - offset) / scale);
+    return static_cast<std::uint16_t>(std::clamp(q, 0.0, 65535.0));
+}
+
+// Write a .ptdem exactly as fetch_planet_dem.py bakes it: 40-byte header,
+// the elevation plane, and (v2 only) the relief plane. The field order here
+// is the DemHeader layout, which is padding-free at 40 bytes (static_assert
+// in ElevationField.h), so this is byte-identical to the tool's output.
+void WritePtdem(const std::string& path, bool v2,
+                std::uint32_t w, std::uint32_t h,
+                const std::vector<double>& elev_m,
+                const std::vector<double>& relief_m) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(v2 ? kDemMagic : kDemMagicV1, 8);
+    f.write(reinterpret_cast<const char*>(&w), 4);
+    f.write(reinterpret_cast<const char*>(&h), 4);
+    const double scale = kDemScaleM, off = kDemOffsetM;
+    f.write(reinterpret_cast<const char*>(&scale), 8);
+    f.write(reinterpret_cast<const char*>(&off), 8);
+    const std::uint32_t flags = v2 ? kDemFlagReliefPlane : 0u;
+    const std::uint32_t reserved = 0u;
+    f.write(reinterpret_cast<const char*>(&flags), 4);
+    f.write(reinterpret_cast<const char*>(&reserved), 4);
+    for (double m : elev_m) {
+        const std::uint16_t v = QuantAffine(m, kDemScaleM, kDemOffsetM);
+        f.write(reinterpret_cast<const char*>(&v), 2);
+    }
+    if (v2) {
+        for (double m : relief_m) {
+            const std::uint16_t v = QuantAffine(m, kDemReliefScaleM, kDemReliefOffsetM);
+            f.write(reinterpret_cast<const char*>(&v), 2);
+        }
+    }
+}
+
+// Build a full-resolution field with genuine but mean-free sub-texel relief,
+// and reproduce both bake pipelines from it: the decimated elevation (area
+// average) and the TRUE relief (compute_relief's statistic on full res).
+struct Fixture {
+    int OW, OH, D, FW, FH;
+    std::vector<double> dec;     // decimated elevation, OW*OH
+    std::vector<double> truer;   // true full-res relief, OW*OH
+};
+
+Fixture MakeReliefFixture(int OW = 16, int OH = 8, int D = 12) {
+    Fixture fx{OW, OH, D, OW * D, OH * D, {}, {}};
+    const int FW = fx.FW, FH = fx.FH;
+    std::vector<double> full(static_cast<std::size_t>(FW) * FH);
+    for (int y = 0; y < FH; ++y)
+        for (int x = 0; x < FW; ++x)
+            full[static_cast<std::size_t>(y) * FW + x] = 1000.0 + FixtureRough(x, y);
+
+    // Decimate by area average -- resample()'s block mean, exactly.
+    fx.dec.assign(static_cast<std::size_t>(OW) * OH, 0.0);
+    for (int J = 0; J < OH; ++J)
+        for (int I = 0; I < OW; ++I) {
+            double s = 0.0;
+            for (int yy = J * D; yy < (J + 1) * D; ++yy)
+                for (int xx = I * D; xx < (I + 1) * D; ++xx)
+                    s += full[static_cast<std::size_t>(yy) * FW + xx];
+            fx.dec[static_cast<std::size_t>(J) * OW + I] = s / (D * D);
+        }
+
+    // True relief on the full-res grid -- compute_relief()'s statistic:
+    // central diff at lag D (lon wraps, lat clamps), 0.5*(gE^2+gN^2), RMS
+    // over the footprint.
+    auto at = [&](int x, int y) {
+        const int xi = ((x % FW) + FW) % FW;         // lon wraps
+        const int yi = std::clamp(y, 0, FH - 1);     // lat clamps
+        return full[static_cast<std::size_t>(yi) * FW + xi];
+    };
+    fx.truer.assign(static_cast<std::size_t>(OW) * OH, 0.0);
+    for (int J = 0; J < OH; ++J)
+        for (int I = 0; I < OW; ++I) {
+            double acc = 0.0;
+            for (int yy = J * D; yy < (J + 1) * D; ++yy)
+                for (int xx = I * D; xx < (I + 1) * D; ++xx) {
+                    const double gE = 0.5 * (at(xx + D, yy) - at(xx - D, yy));
+                    const double gN = 0.5 * (at(xx, yy + D) - at(xx, yy - D));
+                    acc += 0.5 * (gE * gE + gN * gN);
+                }
+            fx.truer[static_cast<std::size_t>(J) * OW + I] = std::sqrt(acc / (D * D));
+        }
+    return fx;
+}
+
+}  // namespace
+
+TEST_CASE("the relief plane restores the second moment area-averaging destroys (#318)") {
+    // #318: fetch_planet_dem.py area-averages ETOPO to the output grid. An
+    // area average preserves each texel's MEAN (so the heights validate) and
+    // low-passes away its inter-texel VARIANCE -- sigma(L_dem), the relief the
+    // whole fractal continuation is anchored on. Deriving relief from the
+    // decimated grid afterwards (the pre-#318 BuildReliefMap path) cannot
+    // recover it. The fix measures relief on the full-resolution grid and
+    // carries it in a second plane. This asserts on that second moment
+    // directly -- the quantity the issue says nothing measured.
+    const Fixture fx = MakeReliefFixture();
+    const std::string v1 = "pt_dem318_v1.ptdem";   // legacy: no relief plane
+    const std::string v2 = "pt_dem318_v2.ptdem";   // fixed: relief plane
+    WritePtdem(v1, /*v2=*/false, fx.OW, fx.OH, fx.dec, {});
+    WritePtdem(v2, /*v2=*/true,  fx.OW, fx.OH, fx.dec, fx.truer);
+
+    DigitalElevationModel dem1, dem2;
+    std::string err;
+    REQUIRE(dem1.Load(v1, err));
+    REQUIRE(dem2.Load(v2, err));
+    // The two ship the SAME elevation grid; only the relief source differs.
+    CHECK_FALSE(dem1.ReliefFromFile());   // derived from the decimated grid
+    CHECK(dem2.ReliefFromFile());         // read from the plane
+
+    // Sample relief at an interior texel centre. SampleAt lands exactly on the
+    // texel there (tx = ty = 0), so it reads that texel's stored/derived value.
+    const int I0 = 8, J0 = 4;
+    const double lon = -kPi + (I0 + 0.5) * 2.0 * kPi / fx.OW;
+    const double lat =  0.5 * kPi - (J0 + 0.5) * kPi / fx.OH;
+    double h1 = 0, r1 = 0, h2 = 0, r2 = 0;
+    dem1.SampleAt(lat, lon, h1, r1);
+    dem2.SampleAt(lat, lon, h2, r2);
+    const double truth = fx.truer[static_cast<std::size_t>(J0) * fx.OW + I0];
+
+    // The heights are byte-for-byte the same data both ways -- the average
+    // preserved the mean, which is why height-based validation never caught
+    // this. If the fix moved the heights it would move every terrain golden
+    // for the wrong reason.
+    CHECK(std::abs(h1 - h2) < 1e-9);
+
+    // (1) The plane returns the true full-resolution relief within one
+    //     quantisation step. The format round-trips the second moment intact.
+    CHECK(std::abs(r2 - truth) <= 1.5 * kDemReliefScaleM);   // ~0.45 m
+
+    // (2) THE BUG, asserted: differencing the decimated grid suppresses the
+    //     relief to a small fraction of the truth -- the mean threw the
+    //     sub-texel variance away. The margin here is ~20x, so this is not a
+    //     tuned edge; it is the low-pass filter, measured.
+    CHECK(r1 < 0.25 * truth);
+
+    // (3) THE FIX, asserted, and the red/green line: relief the old pipeline
+    //     could produce (r1) fails this; relief the new pipeline carries (r2)
+    //     passes it. A test that would FAIL on the old area-averaged pipeline.
+    CHECK(r2 > 3.0 * r1);
+
+    std::remove(v1.c_str());
+    std::remove(v2.c_str());
+}
+
+TEST_CASE("the relief plane preserves level-consistency and bake determinism (#318)") {
+    // Relief now enters the field from a file plane rather than from
+    // BuildReliefMap, so re-establish -- with a real DEM loaded -- the two
+    // invariants the whole scheme rests on: a level-L chunk and its level-
+    // (L+1) child are BIT-IDENTICAL at shared vertices, and a bake is a pure
+    // function of the key. Relief is a continuous bilinear pure function of
+    // direction regardless of its source, so this holds; verified, not
+    // assumed. (Seam determinism follows by the same mechanism: at a seam the
+    // two faces sample the same direction -> same lat/lon -> same bilinear
+    // relief, exactly as the "agrees across a cube seam" case shows.)
+    const Fixture fx = MakeReliefFixture();
+    const std::string v2 = "pt_dem318_consistency.ptdem";
+    WritePtdem(v2, /*v2=*/true, fx.OW, fx.OH, fx.dec, fx.truer);
+    DigitalElevationModel dem;
+    std::string err;
+    REQUIRE(dem.Load(v2, err));
+    REQUIRE(dem.ReliefFromFile());
+
+    ElevationField field;
+    field.SetDem(&dem);
+    ElevationParams p;
+    field.SetParams(p);
+    REQUIRE(field.HasData());
+
+    for (int level = 3; level <= 8; ++level) {
+        const ChunkKey parent{2, static_cast<std::uint8_t>(level), 1u, 1u};
+        std::vector<double> pg, pg2;
+        field.GenerateChunkHeights(parent, level, 0, pg);
+        field.GenerateChunkHeights(parent, level, 0, pg2);
+        REQUIRE(pg.size() == static_cast<std::size_t>(kChunkVerts) * kChunkVerts);
+        // Determinism: the same key bakes to identical bytes.
+        for (std::size_t i = 0; i < pg.size(); ++i) CHECK(pg[i] == pg2[i]);
+
+        for (int q = 0; q < 4; ++q) {
+            const ChunkKey child = parent.Child(q);
+            std::vector<double> cg;
+            field.GenerateChunkHeights(child, static_cast<int>(child.level), 0, cg);
+            const int ox = (q & 1) * (kChunkQuads / 2);
+            const int oy = ((q >> 1) & 1) * (kChunkQuads / 2);
+            for (int y = 0; y <= kChunkQuads; y += 2)
+                for (int x = 0; x <= kChunkQuads; x += 2) {
+                    const double a = cg[static_cast<std::size_t>(y) * kChunkVerts + x];
+                    const double b = pg[static_cast<std::size_t>(oy + y / 2) * kChunkVerts
+                                        + (ox + x / 2)];
+                    CHECK(a == b);   // bit-identical across levels
+                }
+        }
+    }
+    std::remove(v2.c_str());
 }
 
 TEST_CASE("procedural detail scales with the measured Hurst exponent") {
