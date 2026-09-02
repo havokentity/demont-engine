@@ -193,6 +193,75 @@
 // Andean scarp, the trench walls -- where a threshold-hillslope cap is
 // exactly the right physics rather than a patch over a bad extrapolation.
 //
+// THE STRUCTURAL LIMIT OF THIS LAW -- WHY CORRECT RELIEF STILL READS ~20 deg
+// AT THE KHUMBU AT THE 270 m LAG (#330)
+// -------------------------------------------------------------------------
+// #318 restored the relief second moment (Khumbu texel relief up to ~500 m),
+// yet the reference-scale slope this law derives at the Gabet 180 m baseline
+// (kRefSlopeHalfLagM; the operator Gabet, Pratt-Sitaula & Burbank 2004 used,
+// ~270 m length scale) still reads a MEDIAN of only ~20 deg at the Everest
+// site, against ~30 deg published. #330 is the measurement of why, and the
+// finding is that the shortfall is NOT a mis-set parameter -- it is the
+// ceiling of a single-anchor, single-exponent, linear-in-relief law.
+//
+// Measured (production ReferenceSlope01 over a 4x4 level-13 block; the
+// analytic sigma(l)/l is smaller because it omits the finite-difference
+// accumulation kRefSlopeRmsGain folds back in):
+//
+//   * The DECOMPOSITION. The fine detail is not the problem: the baked
+//     field's RMS slope already exceeds 30 deg below ~40 m (34 deg at 19 m,
+//     50 deg at 0.3 m at Everest). The shortfall is confined to the
+//     100-500 m band. There the continuation is anchored on relief at the
+//     19.5 km floor with H_coarse = 0.5, and the reference operator reads a
+//     median of only ~20 deg -- because slope(l) = relief * S(l) / l has
+//     grown too slowly from the floor to reach the threshold by the
+//     hillslope band. It is candidate (a): the single anchor extrapolated
+//     ~7 octaves undershoots the intermediate band for high-relief terrain.
+//     The break (candidate b) is secondary: removing it entirely (L_b -> 0)
+//     lifts Everest only 20.6 -> 24.4 deg while it detonates the 1 m slope
+//     back to the #304 divergence (Kansas 1.7 -> 11.6 deg, abyssal
+//     3.3 -> 21.3 deg). Lengthening the break (candidate c) LOWERS the
+//     reference slope, so the break is not too short. Even the divergent
+//     no-break law never reaches 30 deg at Everest: relief 500 m under
+//     H = 0.5 cannot.
+//
+//   * WHY NO GLOBAL KNOB FIXES IT. Dropping H_coarse to ~0.37 does lift
+//     Everest to ~30 deg -- but the same drop pushes the Annapurna site
+//     (the planet_hillslope_rock camera) from 44 to ~53 deg, over-rocking a
+//     cell that already renders correctly at 43 deg, and lifts the abyssal
+//     Pacific 1 m slope past its Shepard et al. (2001) band. The reference
+//     slope is EXACTLY linear in relief (asserted in the terrain tests), so
+//     one exponent maps relief to slope by one proportionality for every
+//     terrain class at once. Real hillslope angle is a SATURATING function
+//     of relief -- it rises then pins at the landsliding threshold, ~30-35
+//     deg (Burbank et al. 1996; Montgomery & Brandon 2002, EPSL 201:481;
+//     DiBiase et al. 2010, EPSL 289:134). A linear law cannot be both steep
+//     enough at moderate relief (Everest, 500 m) and bounded at extreme
+//     relief (Annapurna, 1450 m); it undershoots the first and overshoots
+//     the second, which is exactly what is measured. A saturating transfer
+//     would fix the overshoot but, being concave, cannot RAISE the moderate
+//     end -- so it does not close the Everest gap either.
+//
+//   * THE SITE. Gabet, Pratt-Sitaula & Burbank (2004) measured the
+//     Marsyandi valley, CENTRAL Nepal -- the Annapurna Himal, which is where
+//     planet_hillslope_rock stands (28.389 N 84.111 E) and where this law
+//     ALREADY yields a ~44 deg median, at or above their ~30 deg. The
+//     Everest/Khumbu site (27.9881 N 86.9250 E, planet_surface) is EASTERN
+//     Nepal, glaciated, and 2.2 km above the derived snowline -- a camera
+//     planet_hillslope_rock.cfg itself documents as a correct snowfield.
+//     So the ~20 deg there is not obviously wrong; the ~30 deg target may be
+//     the central-Nepal number read at the wrong texel.
+//
+// The honest resolution is therefore NOT a re-tuned amplitude or exponent
+// (either regresses a class this arc already got right). It is one of:
+// (1) a threshold-hillslope SATURATING transfer, relief -> slope, which is a
+//     new sub-model needing S_c and a relief scale calibrated to the papers
+//     above and its own cross-class validation; (2) a second measured anchor
+//     at an intermediate scale, which the 19.5 km DEM cannot supply below
+//     its floor; or (3) accepting that the Everest texel is correctly ~20
+//     deg and correcting the target-site attribution. #330 scopes all three
+//     and changes no coefficient, so no golden moves.
+//
 // The choice of an INTERPOLATORY subdivision -- displacement is added only
 // at vertices that are new at that level, and is exactly zero at every
 // vertex inherited from the level above -- is the load-bearing one. It
