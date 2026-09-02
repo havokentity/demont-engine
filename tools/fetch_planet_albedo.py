@@ -238,7 +238,11 @@ MCD43C3_SIZE_BYTES = 192_075_352
 
 ALB_MAGIC = b"PTALB001"
 ALB_FLAG_MEASURED_ALBEDO = 1 << 0
-DEM_MAGIC = b"PTDEM001"
+# This tool reads only the DEM's elevation plane (40-byte header + w*h*2
+# uint16 heights) to derive the land/water coverage mask. That plane is
+# byte-identical across the format versions -- PTDEM002 (#318) merely appends
+# a second relief plane the coverage bake does not touch -- so accept both.
+DEM_MAGICS = (b"PTDEM001", b"PTDEM002")
 
 # --validate's reference set.
 #
@@ -893,8 +897,9 @@ def dem_land_mask(dem_path, out_w, out_h):
         return np.full((out_h, out_w), 255, dtype=np.uint8)
     with open(dem_path, "rb") as f:
         head = f.read(40)
-        if head[:8] != DEM_MAGIC:
-            sys.exit(f"[bake] {dem_path}: bad magic, expected PTDEM001")
+        if head[:8] not in DEM_MAGICS:
+            sys.exit(f"[bake] {dem_path}: bad magic {head[:8]!r}, "
+                     f"expected one of {DEM_MAGICS}")
         w, h = struct.unpack("<II", head[8:16])
         scale, offset = struct.unpack("<dd", head[16:32])
         raw = f.read(w * h * 2)
