@@ -805,12 +805,16 @@ TEST_CASE("the threshold-hillslope transfer saturates slope at S_c (#330)") {
         CHECK(SaturateHillslopeSlope(d, sp, -1.0) == d);
     }
 
-    // (b) Identity to a fraction of a percent for sub-threshold ground -- what
-    // keeps Kansas, the Sahara and the abyssal plains bit-unchanged. At a
-    // tenth of S_c the deviation is the leading (S_lin/S_c)^2 term, ~1%.
+    // (b) NEAR-identity (not bit-identity) for sub-threshold ground -- what
+    // keeps Kansas, the Sahara and the abyssal plains unchanged to ~1e-5
+    // relative on real relief (sub-micron on the mesh), not bit-for-bit: the
+    // transfer is a strict contraction, exactly the identity in double only
+    // for an increment slope below ~1e-4, far under these sites' 0.03-0.15.
+    // At a tenth of S_c the deviation is the leading (S_lin/S_c)^n/n term.
     {
         const double d = 0.1 * cap;
         CHECK(SaturateHillslopeSlope(d, sp, Sc) == doctest::Approx(d).epsilon(0.02));
+        CHECK(SaturateHillslopeSlope(d, sp, Sc) != d);   // contraction, not identity
     }
 
     // (c) Odd: sign in, sign out, magnitude symmetric.
