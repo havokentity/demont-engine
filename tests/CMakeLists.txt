@@ -2129,6 +2129,70 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # blue where iron oxide does) rather than its pixels.
     pt_add_golden_cell(SCENE planet_land_orbit BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
+    # --- #317: the SAME disc WITH the sea -------------------------------
+    # planet_land_orbit above pins r_planet_ocean 0 so the specular sea
+    # cannot perturb the land-colour measurement -- which means it dodges
+    # the exact configuration every cold start ships (terrain + ground +
+    # ocean all on). #317 was a waterworld THERE: the sea-level shell
+    # covered the whole globe and no land showed, and NO golden exercised
+    # it, which is how it shipped uncaught. This cell is that golden -- the
+    # A/B sibling that differs from planet_land_orbit in exactly one line,
+    # r_planet_ocean, so the imgdiff between the two committed PNGs IS the
+    # ocean shell's contribution and #317 is the difference between them.
+    #
+    # DETERMINISM. Same freeze + settle barrier as the sibling; verified
+    # bit-identical run to run (equal renders, imgdiff at zero thresholds
+    # bad=0, max 0.0000, mean 0.000000), so the noise floor is zero and
+    # every figure below is signal. Converges in 1 settle round, 6 chunks.
+    #
+    # EXPOSURE RE-DERIVED, NOT INHERITED -- the ocean changes the frame's
+    # luminance distribution, so planet_land_orbit's 0.05 does not carry
+    # over. Swept at FRAMES 32 over the illuminated disc (~27 k px), the
+    # two chroma separations the acceptance rests on move in OPPOSITE
+    # directions, unlike the sibling where both rose together:
+    #
+    #     exposure  discmed  clip%  levels  soil R-B  sea B-R
+    #       0.03      84.9    0.00    221      57.0     77.0
+    #       0.05      97.3    0.00    232      51.0    102.0
+    #       0.08     121.2    0.00    238      46.0    124.0
+    #       0.12     146.0    0.00    241      41.0    140.0
+    #       0.16     163.8    0.86    243      35.0    147.0
+    #
+    # Land soil chroma (iron oxide, R-B) FALLS with exposure as the bright
+    # land washes out; sea blue (B-R) RISES. Normalising each to its own
+    # peak, the minimum of the two is maximised at 0.08 (soil 0.81, sea
+    # 0.84) -- the balance point where land AND sea are both well separated,
+    # on the distinct-level plateau (238 of a 243 max) with nothing clipped.
+    # That is the house method's "plateau of levels at the peak of the
+    # chroma separations", re-run for a frame that now has two of them.
+    #
+    # NON-VACUOUS IN BOTH DIRECTIONS -- the whole point of the cell is that
+    # it holds land AND sea, so both feature deletions must move it. Against
+    # the committed golden, at MAX_DELTA 16:
+    #     r_planet_ocean 0      (sea removed)  mean 13.47  bad 7.57%  max 289
+    #     r_planet_land_albedo 0 (land colour) mean  4.38  bad 6.81%  max 267
+    #   The ocean-off ablation is planet_land_orbit's own config, so the
+    #   13.47 IS the sea's contribution measured directly. The land-off
+    #   ablation keeps the raster loaded (so the coverage gate still runs
+    #   and land still occludes the shell) and only zeroes the colour, so it
+    #   is the strict "did the land cover reach the pixels" test. A third
+    #   deletion -- reverting the #317 shader hunk -- returns the waterworld
+    #   (all sea) and moves it far more; that red/green is in the PR.
+    #
+    # TOLERANCES, sized against the WEAKEST ablation (land-off, mean 4.38 /
+    # bad 6.81%), noise floor zero:
+    #   MEAN_DELTA 0.8  -> 5.5x below the weakest signal, infinitely above
+    #                      the zero noise floor. Same value and reasoning as
+    #                      the sibling family.
+    #   FAIL_PERCENT 1  -> 6.8x below the weakest signal's 6.81%.
+    #   MAX_DELTA 16    -> the matrix default, NOT tightened toward the
+    #                      measured 0.0000 run-to-run: one M4 Max is not a
+    #                      sample and the headroom is for another driver's
+    #                      fma ordering, exactly as every other planet cell
+    #                      here argues.
+    # Re-measure if the camera, resolution, exposure or frame count moves.
+    pt_add_golden_cell(SCENE planet_land_orbit_ocean BACKEND metal DENOISER off
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off

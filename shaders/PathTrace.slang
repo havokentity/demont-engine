@@ -902,6 +902,35 @@ float4 ptLandAlbedoSample(float lat_rad, float lon_rad) {
     return lerp(top, bot, ty);
 }
 
+// --- Is there ocean at a sea-level-shell point? (#317) ----------------------
+//
+// The planetary ocean shell is a sea-level sphere, but the sea only exists
+// where the solid Earth stands BELOW sea level. From orbit the terrain
+// chunks reach only around the site and the analytic backstop body sits far
+// below the waterline, so nothing geometric occludes the shell over land --
+// it has to ask the land/sea mask directly. The only global "is the ground
+// above sea level here" signal on the GPU is the land-cover raster's
+// COVERAGE byte, baked (fetch_planet_albedo.py: dem_land_mask) from the same
+// DEM the terrain meshes: 255 where DEM >= 0, area-averaged and thresholded
+// at 0.5. So coverage >= 0.5 is the DEM/geoid-zero land mask, the identical
+// curve the body paints its albedo split on -- returning false there removes
+// the shell and lets the land-bearing body (or a terrain chunk) behind it
+// win. It is a geoid-zero mask and NOT a true coastline: dry land below sea
+// level (the Qattara Depression, the Dead Sea shore) is on the ocean side of
+// it and renders as sea, and inland water bodies are inconsistent -- tracked
+// as #327, and the from-orbit land/sea split does not depend on it.
+//
+// With no raster loaded the mask is unavailable, so this returns true (the
+// shell stays). Scenes that have a raster but no solid body to reveal are
+// handled by the caller's planet_ground.w guard, not here -- see the call
+// site in traceScene.
+bool ptShellIsWaterAt(float3 p_world) {
+    if (!ptLandAlbedoReady()) return true;
+    float2 ll = ptGeodeticFromWorld(p_world);
+    float  coverage = ptLandAlbedoSample(ll.x, ll.y).a;
+    return coverage < 0.5;
+}
+
 // --- The snowline, derived rather than dialled ------------------------------
 //
 // Mirrors SnowlineAltitudeM in src/renderer/Planet/SurfaceAlbedo.h, where
@@ -3409,9 +3438,42 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
     // "where is sea level" is a single number rather than a value the
     // ocean and the terrain each hold a copy of.
     //
-    // WHY NOTHING HIDES IT UNDER THE CONTINENTS. traceScene keeps the
-    // closest hit and the terrain chunks sit ABOVE this radius wherever
-    // the DEM is positive, so land occludes the shell with no test at all.
+    // WHAT HIDES IT UNDER THE CONTINENTS (#317). The original claim here
+    // was that the terrain chunks sit ABOVE this radius wherever the DEM
+    // is positive, so land occludes the shell with no test at all. That
+    // holds ONLY where a chunk is the surface -- i.e. within a few hundred
+    // km of the site. From orbit it is false twice over: the terrain
+    // quadtree meshes chunks around one site, so the rest of the globe has
+    // no chunk at all, and the thing behind the shell there is the P3
+    // analytic BACKSTOP body -- deliberately R_sea - 27 706 m (WGS-84 b +
+    // Challenger Deep - 65 m), below the deepest ocean so a streaming gap
+    // never holes the world. A sphere 27.7 km below sea level cannot
+    // occlude a sea-level shell, so the shell wins EVERY pixel and the
+    // default launch is a waterworld -- measured: a hit-classification
+    // render of the orbital disc is 100 % MAT_WATER, over the Sahara and
+    // over the Himalaya alike.
+    //
+    // So the shell consults the land/sea mask before it shades, exactly
+    // where the analytic body already consults it for albedo. The mask is
+    // the land-cover raster's COVERAGE byte, which fetch_planet_albedo.py
+    // bakes from the engine's own DEM (dem_land_mask: 255 where DEM >= 0,
+    // area-averaged and thresholded at 0.5). Coverage >= 0.5 is therefore
+    // the SAME DEM/geoid-zero land mask the raster's colour flips on -- not
+    // a tuned number, and by construction it cannot disagree with the land
+    // the body paints one texel away. It is a geoid-zero mask and not a true
+    // coastline (sub-sea-level dry land renders as sea, inland lakes are
+    // inconsistent -- #327), which the from-orbit land/sea split does not
+    // depend on.
+    //
+    // GATED ON THE BACKSTOP BODY BEING PRESENT (planet_ground.w > 0). A pure
+    // ocean world -- the P5 fixtures, ground and terrain both off -- still
+    // loads the raster, because r_planet_albedo_map defaults to a real file;
+    // but there is no solid surface behind the shell, so suppressing it over
+    // "land" coverage would open a hole to space where an ocean planet must
+    // stay wet. Only when a body (or terrain) exists to reveal is the shell
+    // allowed to defer to it, so every ocean-only cell is untouched and the
+    // waterworld it is protecting against cannot recur.
+    //
     // Below sea level the shell is nearer than the seabed and the water
     // wins. The one case that needs care is a ray that starts BELOW the
     // surface: intersectSphere returns the first root past t_min, which
@@ -3424,7 +3486,8 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
     if (planet_ocean.x > 0.0) {
         float t_w;
         if (intersectSphere(ro, rd, planet_center_radius.xyz,
-                            planet_ocean.x, t_min, t_w) && t_w < h.t) {
+                            planet_ocean.x, t_min, t_w) && t_w < h.t
+            && (planet_ground.w <= 0.0 || ptShellIsWaterAt(ro + rd * t_w))) {
             h.hit = true;
             h.t = t_w;
             // localUp() at the hit, i.e. the same expression the sky, the
