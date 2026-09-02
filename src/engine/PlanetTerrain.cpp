@@ -21,9 +21,12 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// Per-vertex shader payload stride, in floats. Mirrors
-// StructuredBuffer<float4> terrain_verts in PathTrace.slang.
-constexpr std::size_t kVertFloats = 4;
+// Per-vertex shader payload stride, in floats. ONE definition, in
+// TerrainChunk.h next to the channel list, so the producer
+// (BuildTerrainChunk), the arena size here and the shader's
+// StructuredBuffer<float> terrain_verts cannot drift apart.
+constexpr std::size_t kVertFloats =
+    static_cast<std::size_t>(pt::planet::kVertexPayloadFloats);
 
 }  // namespace
 

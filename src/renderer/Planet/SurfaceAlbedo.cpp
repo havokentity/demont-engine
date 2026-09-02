@@ -23,6 +23,16 @@ double Smoothstep01(double t) noexcept {
 // the observed zonal-mean temperature with.
 double LegendreP2(double x) noexcept { return 0.5 * (3.0 * x * x - 1.0); }
 
+// The ramp's endpoints, in the shader's slope01 = 1 - cos(tilt) measure and
+// in tangent. Evaluated once at static-init rather than per call: the area
+// integral below evaluates the ramp tens of times per vertex, and two
+// cosines of a compile-time constant inside that loop was measurably most
+// of a coarse chunk's bake.
+const double kRockRampLo01  = 1.0 - std::cos(kThresholdHillslopeDeg * kPi / 180.0);
+const double kRockRampHi01  = 1.0 - std::cos(kRockFullExposureDeg   * kPi / 180.0);
+const double kRockRampLoTan = std::tan(kThresholdHillslopeDeg * kPi / 180.0);
+const double kRockRampHiTan = std::tan(kRockFullExposureDeg   * kPi / 180.0);
+
 }  // namespace
 
 // --- The snowline ----------------------------------------------------------
@@ -56,10 +66,108 @@ double SnowlineAltitudeM(double lat_rad, double tropical_anchor_m) noexcept {
 // --- Threshold hillslope ---------------------------------------------------
 
 double SlopeRockFraction(double slope01) noexcept {
-    const double lo = 1.0 - std::cos(kThresholdHillslopeDeg * kPi / 180.0);
-    const double hi = 1.0 - std::cos(kRockFullExposureDeg   * kPi / 180.0);
-    if (!(hi > lo)) return 0.0;
-    return Smoothstep01((slope01 - lo) / (hi - lo));
+    if (!(kRockRampHi01 > kRockRampLo01)) return 0.0;
+    return Smoothstep01((slope01 - kRockRampLo01)
+                        / (kRockRampHi01 - kRockRampLo01));
+}
+
+namespace {
+
+// Composite Simpson over [tan 30, tan 45], a 0.4226-wide interval. 64
+// intervals put the abscissae 6.6e-3 apart against a smoothstep whose
+// full width is the interval itself, so the quadrature error is far
+// below the 2e-3 the terrain test compares it against.
+constexpr int kRockQuadSteps = 64;             // even, for Simpson
+
+// THE ABSCISSAE ARE FIXED, SO HALF THE INTEGRAND IS TOO (#307 follow-up).
+//
+// The integrand is SlopeRockFraction(slope01(t)) * p(t), and only p depends
+// on sigma. The ramp factor is a function of the ABSCISSA ALONE -- and the
+// abscissae are a compile-time-fixed lattice on a compile-time-fixed
+// interval. Recomputing `1 - 1/sqrt(1 + t*t)` and the smoothstep on every
+// call meant a sqrt and a cubic per abscissa per vertex: 274 625 of each
+// per coarse chunk bake, all of them producing the same 65 numbers.
+//
+// They are computed ONCE here instead. This is a pure hoist, not an
+// approximation: `t_i` is formed by the identical expression the loop used,
+// so every tabulated value is bit-for-bit what the inline form produced,
+// and the quadrature below still evaluates the same sum in the same order.
+struct RockQuadTable {
+    double t[kRockQuadSteps + 1];      // abscissa
+    double t2[kRockQuadSteps + 1];     // t*t, for the Rayleigh exponent
+    double ramp[kRockQuadSteps + 1];   // SlopeRockFraction(slope01(t))
+    double dt;
+};
+
+const RockQuadTable& RockQuad() {
+    static const RockQuadTable table = [] {
+        RockQuadTable q{};
+        q.dt = (kRockRampHiTan - kRockRampLoTan) / kRockQuadSteps;
+        for (int i = 0; i <= kRockQuadSteps; ++i) {
+            // Endpoints by name rather than by `lo + kSteps*dt`, because
+            // that is what the inline form evaluated and the two need not
+            // agree in the last bit.
+            const double t = (i == 0)              ? kRockRampLoTan
+                           : (i == kRockQuadSteps) ? kRockRampHiTan
+                           : kRockRampLoTan + static_cast<double>(i) * q.dt;
+            // slope01 = 1 - cos(atan t) = 1 - 1/sqrt(1 + t^2), formed
+            // without the trig round trip.
+            q.t[i]    = t;
+            q.t2[i]   = t * t;
+            q.ramp[i] = SlopeRockFraction(1.0 - 1.0 / std::sqrt(1.0 + t * t));
+        }
+        return q;
+    }();
+    return table;
+}
+
+}  // namespace
+
+double RockFractionFromRmsSlope(double rms_slope_tan_per_axis) noexcept {
+    const double s = rms_slope_tan_per_axis;
+    if (!(s > 0.0)) return 0.0;
+    if (!(kRockRampHiTan > kRockRampLoTan)) return 0.0;
+    const double inv2s2 = 0.5 / (s * s);
+
+    // The Rayleigh SURVIVAL function, exp(-t^2 / 2 sigma^2), is elementary,
+    // and the ramp is exactly 1 above tan(45 deg) -- so the whole upper
+    // tail is closed form and only the ramp's own 0.5774..1.0 band has to
+    // be integrated. That is a FIXED, FINITE interval: the quadrature cost
+    // does not grow with sigma, the tail is exact rather than truncated,
+    // and the integrand is smooth across it.
+    const double tail = std::exp(-kRockRampHiTan * kRockRampHiTan * inv2s2);
+
+    const RockQuadTable& q = RockQuad();
+    const double two_inv2s2 = 2.0 * inv2s2;
+    // f(t_i), with the ramp factor read from the table. The grouping is the
+    // one the inline lambda used -- ramp * ((t * (2*inv2s2)) * exp(...)) --
+    // so the sum is bit-for-bit the previous one.
+    auto f = [&](int i) -> double {
+        return q.ramp[i] * (q.t[i] * two_inv2s2 * std::exp(-q.t2[i] * inv2s2));
+    };
+    double acc = f(0) + f(kRockQuadSteps);
+    // THE RAYLEIGH TAIL UNDERFLOWS, AND SKIPPING WHAT UNDERFLOWS IS EXACT.
+    //
+    // Over gentle ground sigma is small, the exponent runs to several
+    // hundred negative, and std::exp returns EXACTLY 0.0 -- whereupon
+    // f(i) is exactly +0.0 and `acc += coeff * 0.0` leaves acc bit-for-bit
+    // unchanged. t_i increases monotonically, so once one term underflows
+    // every later one does and the loop can stop. Measured over 9 600
+    // directions on the shipped Earth grid, 31.2% of all quadrature terms
+    // are in that state.
+    //
+    // The threshold is deliberately CONSERVATIVE. std::exp underflows to
+    // zero below about -745.13; -746 is safely past it, so this can only
+    // ever skip terms that were already exactly zero. It never skips a
+    // denormal, which would be a small error rather than no error -- and a
+    // small error here would move a golden and break the bit-exact
+    // level-consistency #307 exists to provide.
+    constexpr double kExpUnderflow = -746.0;
+    for (int i = 1; i < kRockQuadSteps; ++i) {
+        if (-q.t2[i] * inv2s2 < kExpUnderflow) break;
+        acc += ((i & 1) ? 4.0 : 2.0) * f(i);
+    }
+    return std::clamp(tail + acc * q.dt / 3.0, 0.0, 1.0);
 }
 
 // --- The raster ------------------------------------------------------------

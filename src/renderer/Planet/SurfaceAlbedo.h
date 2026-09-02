@@ -240,9 +240,54 @@ double SnowlineAltitudeM(double lat_rad, double tropical_anchor_m) noexcept;
 //
 // The measured angles put the transition where the geomorphology does:
 // nothing below 30 degrees, half by 37.5, bare by 45.
+// THE ANGLES CARRY A BASELINE, AND #307 IS ABOUT HONOURING IT. 30 deg is a
+// measurement made on a 3-arcsecond DEM with a one-cell-either-side slope
+// operator -- Gabet, Pratt-Sitaula & Burbank (2004), Geology 32(7):629, say
+// so in as many words, and Burbank et al. (1996) is the same range and the
+// same authors. Feeding this ramp a slope measured over some other baseline
+// is a units error, and it was one: the shader fed it the MESH normal,
+// whose baseline is two chunk cells and therefore changes with the LOD. The
+// baseline the ramp is now evaluated at is 2 * kRefSlopeHalfLagM -- 180 m,
+// a PHYSICAL DISTANCE -- sampled on the level-kRefSlopeLevel lattice. Both
+// constants are in TerrainChunk.h; the second says which grid carries the
+// operator, not what the baseline is divided by.
 inline constexpr double kThresholdHillslopeDeg = 30.0;
 inline constexpr double kRockFullExposureDeg   = 45.0;
 double SlopeRockFraction(double slope01) noexcept;
+
+// --- Rock exposure as an AREA FRACTION (#307) ------------------------------
+//
+// The ramp above answers "is THIS point bare rock". A chunk whose vertices
+// are further apart than the reference baseline cannot ask that question --
+// its mesh does not carry a 180 m signal, and point-sampling one at 5 km
+// intervals is aliasing, not detail. What such a chunk needs is the AREA
+// MEAN of the ramp over its footprint, which is the same quantity
+// prefiltered, exactly as a mip is.
+//
+// The mean is available in closed form because the fractal continuation is
+// a stationary random field given the local relief: its two slope
+// components are the sum of many independent per-level displacements and go
+// Gaussian by the central limit theorem, so the slope MAGNITUDE
+// t = |grad h| is Rayleigh-distributed,
+//
+//     p(t) = (t / sigma^2) exp(-t^2 / (2 sigma^2)),
+//
+// with sigma the per-axis RMS slope tangent. The area fraction is then
+// the ramp integrated against p:
+//
+//     rock = integral_0^inf  SlopeRockFraction(1 - cos(atan t)) p(t) dt
+//
+// The ramp is exactly 0 below tan(30 deg) and exactly 1 above tan(45 deg),
+// so the two tails are elementary -- the upper one is the Rayleigh
+// survival function exp(-t^2 / 2 sigma^2) -- and only the 0.5774..1.0 band
+// between them needs quadrature. The cost is therefore fixed rather than a
+// function of sigma, and the tail is exact rather than truncated.
+//
+// The Gaussian assumption behind the Rayleigh is not asserted:
+// tests/pt_planet_terrain_test.cpp measures the pointwise branch's own area
+// mean at the crossover level and compares, and the residual is recorded
+// with the constant it calibrates.
+double RockFractionFromRmsSlope(double rms_slope_tan_per_axis) noexcept;
 
 // --- The raster ------------------------------------------------------------
 //

@@ -617,15 +617,44 @@ static const uint kPbrMaxLod     = 8u;   // log2(kPbrTileSize=256)
 // build with PT_PLANET_ENABLED=1 and no planet in the scene renders
 // bit-for-bit as before.
 #if PT_PLANET_ENABLED
-// Per-vertex terrain payload, one float4 per vertex, chunk arenas packed
-// end to end:
-//   xyz = outward unit normal. The instance transform is a pure
-//         TRANSLATION (chunk_origin - anchor), so a normal needs no
-//         transform -- this is why the terrain instance transform is
-//         deliberately never given a rotation.
-//   w   = the vertex's ellipsoidal height in metres, which drives the
-//         biome and, from P5, tells the shader it is on seabed.
-[[vk::binding(36, 0)]] StructuredBuffer<float4> terrain_verts;
+// Per-vertex terrain payload, kTerrainVertFloats floats per vertex, chunk
+// arenas packed end to end. Mirrors kVertexPayloadFloats and its channel
+// list in src/renderer/Planet/TerrainChunk.h -- that header is the one
+// definition and this is the reader:
+//   0,1,2 = outward unit normal. The instance transform is a pure
+//           TRANSLATION (chunk_origin - anchor), so a normal needs no
+//           transform -- this is why the terrain instance transform is
+//           deliberately never given a rotation.
+//   3     = the vertex's ellipsoidal height in metres, which drives the
+//           biome and, from P5, tells the shader it is on seabed.
+//   4     = rock01 (#307): threshold-hillslope rock exposure evaluated on
+//           the host at a FIXED physical baseline, already through the
+//           ramp. It replaces the shader deriving a slope from the mesh
+//           normal, whose baseline is two chunk cells and therefore a
+//           function of the LOD rather than of the ground.
+//
+// A float buffer with a five-float stride rather than a float4 one: the
+// fifth channel would otherwise cost a whole float4 per vertex -- 198 MB
+// of zeroes at the 2 048-chunk arena the terrain fixtures ask for. See
+// TerrainChunk.h.
+[[vk::binding(36, 0)]] StructuredBuffer<float>  terrain_verts;
+static const uint kTerrainVertFloats = 5u;
+
+struct TerrainVert {
+    float3 normal;
+    float  height_m;
+    float  rock01;
+};
+
+TerrainVert loadTerrainVert(uint vertex_index) {
+    uint b = vertex_index * kTerrainVertFloats;
+    TerrainVert v;
+    v.normal   = float3(terrain_verts[b + 0u], terrain_verts[b + 1u],
+                        terrain_verts[b + 2u]);
+    v.height_m = terrain_verts[b + 3u];
+    v.rock01   = terrain_verts[b + 4u];
+    return v;
+}
 // The shared 16-variant stitched index arena. Chunk topology is identical
 // for every chunk, so this is uploaded once (~1.6 MB) and every chunk
 // indexes into it at the offset its stitch variant needs.
@@ -900,27 +929,33 @@ float ptSnowlineAt(float lat_rad, float tropical_anchor_m) {
 
 // --- Threshold-hillslope rock exposure --------------------------------------
 //
+// THE RAMP IS NOT HERE ANY MORE, AND THAT IS THE POINT (#307).
+//
 // Slope drives rock exposure because a steep enough face sheds soil, snow
 // and vegetation -- which a 19.5 km texel cannot know. The two angles are
 // measured: hillslopes in actively uplifting terrain steepen only to a
 // landsliding threshold of ~30 deg (Burbank et al. 1996, Nature 379:505),
 // and dry granular material stands at its ~34 deg angle of repose
 // (Al-Hashemi & Al-Amoudi 2018, Powder Technology 330:397). Bedrock cliffs
-// exceed both, so this ramps from the threshold hillslope to 45 deg rather
-// than switching at one angle.
+// exceed both, so rock exposure ramps from the threshold hillslope to
+// 45 deg rather than switching at one angle. Those constants are unchanged
+// and live in SlopeRockFraction() in src/renderer/Planet/SurfaceAlbedo.cpp.
 //
-// slope01 = 1 - |cos(tilt)|, so the bounds are 1 - cos(30 deg) = 0.1340 and
-// 1 - cos(45 deg) = 0.2929.
+// What moved is the INPUT. #300 evaluated the ramp here, on
+// `slope01 = 1 - |cos(tilt)|` taken from the interpolated MESH normal,
+// whose baseline is two chunk cells: 38.2 m at level 13, 9.5 m at level 15.
+// A slope angle is not scale-free, so the same ground read a different
+// angle at every LOD -- measured, mean rock 0.0585 at level 13 against
+// 0.1841 at level 15 over the same 2x2 block of the reference site. A
+// chunk changed colour when it split.
 //
-// THIS IS THE BUG THAT MADE THE HIMALAYAS UNIFORM WHITE. The ramp here used
-// to be saturate((slope01 - 0.5) * 2.5): zero until slope01 = 0.5 and not
-// saturating until 0.9, which are tilts of 60 and 84.3 degrees. It exposed
-// no rock below a sixty-degree face, and terrain that steep barely exists
-// at a 38 m vertex spacing -- so in practice rock was never exposed at all
-// and every surface above the snowline was snow and nothing else.
-float ptSlopeRockFraction(float slope01) {
-    return smoothstep(0.1340, 0.2929, slope01);
-}
+// The ramp's endpoints are measurements made on a 3-arcsecond DEM with a
+// one-cell-either-side operator (Gabet, Pratt-Sitaula & Burbank 2004,
+// Geology 32:629), so the input has to be a slope at that baseline, and
+// only the host has the elevation field to compute one. The baker does it
+// per vertex on a fixed level-11 lattice over a fixed 180 m baseline and
+// ships the RESULT in terrain_verts channel 4. See kRefSlopeLevel in
+// src/renderer/Planet/TerrainChunk.h for the derivation.
 
 // The procedural classification: the path for a body with NO DATA.
 //
@@ -933,7 +968,7 @@ float ptSlopeRockFraction(float slope01) {
 // It is a SHADING heuristic on top of measured reflectances and is labelled
 // as one. What is NOT here is a Köppen-style classification driven by
 // latitude and a moisture proxy; see the issue for what that would add.
-float3 terrainProceduralAlbedo(float height_m, float slope01, float snowline_m) {
+float3 terrainProceduralAlbedo(float height_m, float rock01, float snowline_m) {
     // Below sea level: seabed, with a sand shelf in the last 30 m. 30 m is
     // not arbitrary -- it is roughly the 1/e depth of the green channel
     // times two (Pope & Fry 1997 give a_g(550) = 0.0565 /m, i.e. 17.7 m),
@@ -943,7 +978,7 @@ float3 terrainProceduralAlbedo(float height_m, float slope01, float snowline_m) 
     // then rock as the slope passes the threshold hillslope, then snow
     // above the snowline.
     float3 land = lerp(kTerrSand, kTerrGrass, saturate(height_m / 40.0));
-    land = lerp(land, kTerrRock, ptSlopeRockFraction(slope01));
+    land = lerp(land, kTerrRock, rock01);
     land = lerp(land, kTerrSnow, saturate((height_m - snowline_m) / 400.0));
     return (height_m >= 0.0) ? land : c;
 }
@@ -967,11 +1002,11 @@ float3 terrainProceduralAlbedo(float height_m, float slope01, float snowline_m) 
 //      a face past the angle of repose, because such a face sheds it.
 //   4. Below sea level the raster is ignored entirely: the seabed is not
 //      something a nadir-viewing satellite measured the reflectance of.
-float3 terrainSurfaceAlbedo(float height_m, float slope01, float3 p_world,
+float3 terrainSurfaceAlbedo(float height_m, float rock01, float3 p_world,
                             float snowline_anchor_m) {
     float2 ll = ptGeodeticFromWorld(p_world);
     float  snowline_m = ptSnowlineAt(ll.x, snowline_anchor_m);
-    float3 proc = terrainProceduralAlbedo(height_m, slope01, snowline_m);
+    float3 proc = terrainProceduralAlbedo(height_m, rock01, snowline_m);
     if (!ptLandAlbedoReady() || height_m < 0.0) return proc;
 
     float4 s = ptLandAlbedoSample(ll.x, ll.y);
@@ -984,7 +1019,7 @@ float3 terrainSurfaceAlbedo(float height_m, float slope01, float3 p_world,
 
     // Rock over the raster too. A satellite sees a mountain range from
     // nadir and averages its faces; the face itself is bare.
-    base = lerp(base, kTerrRock, ptSlopeRockFraction(slope01));
+    base = lerp(base, kTerrRock, rock01);
     // Snow last, and a face sheds it over the SAME threshold-hillslope band
     // that exposes the rock. One angle governs both because it is one
     // mechanism: past the threshold hillslope a slope does not hold
@@ -997,7 +1032,7 @@ float3 terrainSurfaceAlbedo(float height_m, float slope01, float3 p_world,
     // white cone: above the snowline the low-slope faces stay white and the
     // steep ones go to bare rock, which is what a photograph of a range
     // above its snowline actually shows.
-    float shed = 1.0 - ptSlopeRockFraction(slope01);
+    float shed = 1.0 - rock01;
     base = lerp(base, kTerrSnow,
                 saturate((height_m - snowline_m) / 400.0) * shed);
     return base;
@@ -3531,34 +3566,39 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                     uint i0 = terrain_indices[idesc.index_base + prim * 3 + 0];
                     uint i1 = terrain_indices[idesc.index_base + prim * 3 + 1];
                     uint i2 = terrain_indices[idesc.index_base + prim * 3 + 2];
-                    float4 a0 = terrain_verts[idesc.vertex_base + i0];
-                    float4 a1 = terrain_verts[idesc.vertex_base + i1];
-                    float4 a2 = terrain_verts[idesc.vertex_base + i2];
+                    TerrainVert a0 = loadTerrainVert(idesc.vertex_base + i0);
+                    TerrainVert a1 = loadTerrainVert(idesc.vertex_base + i1);
+                    TerrainVert a2 = loadTerrainVert(idesc.vertex_base + i2);
                     float w0 = 1.0 - bary.x - bary.y;
                     // Smooth-shaded normal, used UNTRANSFORMED. The terrain
                     // instance transform is a pure translation
                     // (chunk_origin - anchor) and the streamer never gives a
                     // chunk a rotation, precisely so this stays true.
-                    float3 n = normalize(a0.xyz * w0 + a1.xyz * bary.x
-                                                     + a2.xyz * bary.y);
-                    float  height = a0.w * w0 + a1.w * bary.x + a2.w * bary.y;
+                    float3 n = normalize(a0.normal * w0 + a1.normal * bary.x
+                                                        + a2.normal * bary.y);
+                    float  height = a0.height_m * w0 + a1.height_m * bary.x
+                                                     + a2.height_m * bary.y;
+                    // Rock exposure at the REFERENCE BASELINE (#307), baked
+                    // per vertex and interpolated as the MATERIAL FRACTION
+                    // it is. Interpolating the fraction rather than the
+                    // slope is also the right way round: a triangle covering
+                    // a soil/rock boundary should read as a mixture, which
+                    // is what a linear blend of the two end fractions gives
+                    // and what re-ramping an averaged slope does not.
+                    float  rock01 = a0.rock01 * w0 + a1.rock01 * bary.x
+                                                   + a2.rock01 * bary.y;
                     h.hit = true; h.t = t_mesh;
                     h.normal = n;
                     h.mat = idesc.mat;
-                    // slope01 = 1 - |cos(tilt from local up)|. localUp() is
-                    // P0's per-point up, so this is the real geodetic slope
-                    // rather than a tilt from world +Y.
-                    float3 p_hit   = ro_mesh + rd * t_mesh;
-                    float3 up = localUp(p_hit);
-                    float  slope01 = saturate(1.0 - abs(dot(n, up)));
+                    float3 p_hit = ro_mesh + rd * t_mesh;
                     // Land cover (#300). The hit POSITION, not just its
                     // height: the raster and the snowline are both
                     // functions of where on the planet this is, and
                     // planet_terrain.x now carries the tropical snowline
                     // anchor rather than a value pre-scaled by the site's
                     // own latitude.
-                    h.albedo = terrainSurfaceAlbedo(height, slope01, p_hit,
-                                                    planet_terrain.x);
+                    h.albedo = terrainSurfaceAlbedo(height, saturate(rock01),
+                                                    p_hit, planet_terrain.x);
                     // Sub-footprint slope variance -> roughness. The cone
                     // width at the hit is the same accumulation the bounce
                     // loop performs, evaluated one segment early because

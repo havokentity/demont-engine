@@ -39,6 +39,7 @@
 #include "renderer/Planet/CubedSphere.h"
 #include "renderer/Planet/ElevationField.h"
 #include "renderer/Planet/TerrainChunk.h"
+#include "renderer/Planet/SurfaceAlbedo.h"
 #include "renderer/Planet/TerrainQuadtree.h"
 #include "renderer/Planet/TerrainResidency.h"
 
@@ -709,7 +710,9 @@ TEST_CASE("chunk bake produces finite, correctly-sized, outward geometry") {
         TerrainChunkData d;
         BuildTerrainChunk(key, field, site, d);
         REQUIRE(d.positions.size() == static_cast<std::size_t>(kChunkVertexCount) * 3u);
-        REQUIRE(d.shader_verts.size() == static_cast<std::size_t>(kChunkVertexCount) * 4u);
+        REQUIRE(d.shader_verts.size()
+                == static_cast<std::size_t>(kChunkVertexCount)
+                       * static_cast<std::size_t>(kVertexPayloadFloats));
         for (float v : d.positions)    CHECK(finiteBitsF(v));
         for (float v : d.shader_verts) CHECK(finiteBitsF(v));
         CHECK(finiteBits(d.e_l_m));
@@ -726,17 +729,22 @@ TEST_CASE("chunk bake produces finite, correctly-sized, outward geometry") {
         }
         CHECK(max_local < ChunkEdgeLength(level) * 1.2 + 20000.0);
 
-        // Normals point away from the planet centre.
+        // Normals point away from the planet centre, and rock01 (#307) is
+        // a fraction.
         for (int vi = 0; vi < kChunkVertexCount; ++vi) {
-            const glm::dvec3 n(d.shader_verts[vi * 4 + 0],
-                               d.shader_verts[vi * 4 + 1],
-                               d.shader_verts[vi * 4 + 2]);
+            const auto so = static_cast<std::size_t>(vi)
+                          * static_cast<std::size_t>(kVertexPayloadFloats);
+            const glm::dvec3 n(d.shader_verts[so + 0],
+                               d.shader_verts[so + 1],
+                               d.shader_verts[so + 2]);
             CHECK(std::abs(glm::length(n) - 1.0) < 1e-4);
             const glm::dvec3 p(d.positions[vi * 3 + 0],
                                d.positions[vi * 3 + 1],
                                d.positions[vi * 3 + 2]);
             const glm::dvec3 up = site.WorldUp(d.origin_w + p);
             CHECK(glm::dot(n, up) > 0.0);
+            CHECK(d.shader_verts[so + 4] >= 0.0f);
+            CHECK(d.shader_verts[so + 4] <= 1.0f);
         }
     }
 }
@@ -1627,4 +1635,521 @@ TEST_CASE("a paced stream keeps its coverage; immediate eviction does not") {
     CHECK(without.lost > 0);
     // The fix.
     CHECK(with_policy.lost == 0);
+}
+
+// ===========================================================================
+// #307: the shading slope is a property of the ground, not of the LOD
+// ===========================================================================
+//
+// #300 drove rock exposure off the interpolated MESH normal, whose slope
+// baseline is two chunk cells and therefore a function of the resident
+// level. The first case below reproduces that defect; the rest assert the
+// property that replaced it and the two claims the replacement rests on --
+// that the reference baseline sits in the fluvial regime (so the sub-break
+// roughness model cannot move the land cover), and that the coarse
+// area-mean branch tracks the pointwise one it prefilters.
+
+namespace {
+
+// The rock exposure #300 would have computed for a chunk: the ramp on the
+// slope of the interpolated mesh normal. Kept here, in the tests, because
+// it is the thing that had to go -- the engine no longer contains it.
+std::vector<double> MeshNormalRock(const TerrainChunkData& d,
+                                   const PlanetSite& site) {
+    std::vector<double> out;
+    out.reserve(static_cast<std::size_t>(kChunkVertexCount));
+    for (int vi = 0; vi < kChunkVertexCount; ++vi) {
+        const auto s = static_cast<std::size_t>(vi)
+                     * static_cast<std::size_t>(kVertexPayloadFloats);
+        const glm::dvec3 n(d.shader_verts[s + 0], d.shader_verts[s + 1],
+                           d.shader_verts[s + 2]);
+        const glm::dvec3 p(d.positions[vi * 3 + 0], d.positions[vi * 3 + 1],
+                           d.positions[vi * 3 + 2]);
+        const glm::dvec3 up = site.WorldUp(p + d.origin_w);
+        out.push_back(SlopeRockFraction(
+            std::clamp(1.0 - std::abs(glm::dot(n, up)), 0.0, 1.0)));
+    }
+    return out;
+}
+
+double VertRock(const TerrainChunkData& d, int x, int y) {
+    const auto s = (static_cast<std::size_t>(y) * kChunkVerts + x)
+                 * static_cast<std::size_t>(kVertexPayloadFloats);
+    return d.shader_verts[s + 4];
+}
+
+double MeanOf(const std::vector<double>& v) {
+    double s = 0.0;
+    for (double x : v) s += x;
+    return v.empty() ? 0.0 : s / static_cast<double>(v.size());
+}
+
+}  // namespace
+
+TEST_CASE("rock exposure is bit-identical across LOD levels, and the mesh "
+          "normal it replaced was not") {
+    // 800 m of relief at a 20 km data floor: ordinary mountain terrain, and
+    // enough that the ramp is engaged rather than pinned at either end --
+    // which the non-vacuity checks below insist on.
+    ElevationField field = MakeProceduralField(800.0, 20000.0);
+    const PlanetSite site = PlanetSite::FromGeodetic(0.4, 1.1);
+
+    const ChunkKey parent{2, 12, 1234u, 2345u};
+    TerrainChunkData pd;
+    BuildTerrainChunk(parent, field, site, pd);
+
+    // 13 and 14 are one and two levels below the parent; 16 is FOUR levels
+    // below the reference lattice, i.e. its mesh carries four octaves of
+    // continuation that the reference operator never looks at. If any of
+    // them leaked in, this is where it would show.
+    for (int child_level : {13, 14, 16}) {
+        const int up   = child_level - static_cast<int>(parent.level);
+        const int step = 1 << up;
+        // At level 16 the parent has 256 children; tiling all of them is
+        // 256 chunk bakes for no extra claim. Four is enough to put
+        // thousands of shared vertices under the equality.
+        const int tile = std::min(step, 4);
+        std::size_t shared = 0, engaged = 0;
+        double lo_seen = 1.0, hi_seen = 0.0;
+        double worst = 0.0;
+        for (int cj = 0; cj < tile; ++cj) {
+            for (int ci = 0; ci < tile; ++ci) {
+                const ChunkKey child{parent.face,
+                                     static_cast<std::uint8_t>(child_level),
+                                     parent.i * step + ci,
+                                     parent.j * step + cj};
+                TerrainChunkData cd;
+                BuildTerrainChunk(child, field, site, cd);
+                for (int y = 0; y <= kChunkQuads; ++y) {
+                    for (int x = 0; x <= kChunkQuads; ++x) {
+                        const int gx = ci * kChunkQuads + x;
+                        const int gy = cj * kChunkQuads + y;
+                        if ((gx % step) != 0 || (gy % step) != 0) continue;
+                        const double a = VertRock(pd, gx / step, gy / step);
+                        const double b = VertRock(cd, x, y);
+                        // EQUALITY, not a tolerance. The reference lattice is
+                        // shared and the fractional coordinate of a vertex is
+                        // an exact dyadic rational, so there is nothing here
+                        // for a tolerance to absorb.
+                        CHECK(a == b);
+                        worst = std::max(worst, std::abs(a - b));
+                        ++shared;
+                        if (a > 0.0 && a < 1.0) ++engaged;
+                        lo_seen = std::min(lo_seen, a);
+                        hi_seen = std::max(hi_seen, a);
+                    }
+                }
+            }
+        }
+        CHECK(worst == 0.0);
+        // NOT VACUOUS. An equality over a field that is uniformly zero
+        // passes without testing anything, which is this project's
+        // recurring defect. Insist that the ramp is actually in its
+        // transition band over a large minority of the compared vertices
+        // and that the compared values span most of [0, 1].
+        CHECK(shared > 250u);
+        CHECK(engaged > shared / 10u);
+        CHECK(lo_seen < 0.05);
+        CHECK(hi_seen > 0.95);
+    }
+
+    // The defect, reproduced on the same ground: the mesh normal's own
+    // slope baseline is 2 * ChunkVertexSpacing, so it reads a different
+    // angle at every level and the ramp on top of it moves with the LOD.
+    //
+    // 250 m of relief rather than 800: at 800 m the mesh-normal ramp is
+    // already SATURATED at both levels, which is exactly the state that hid
+    // this defect before #304 -- 0.986 at level 13 and 1.000 at level 15 on
+    // the pre-#304 continuation. A saturated pair proves nothing either
+    // way, so the reproduction runs where the ramp has room to move.
+    ElevationField gentle = MakeProceduralField(250.0, 20000.0);
+    const ChunkKey gp{2, 12, 1234u, 2345u};
+    const ChunkKey gc{gp.face, 14, gp.i * 4, gp.j * 4};
+    TerrainChunkData gpd, gcd;
+    BuildTerrainChunk(gp, gentle, site, gpd);
+    BuildTerrainChunk(gc, gentle, site, gcd);
+    const double mesh_parent = MeanOf(MeshNormalRock(gpd, site));
+    const double mesh_child  = MeanOf(MeshNormalRock(gcd, site));
+    // Both ends have to be off the rails for the ratio to mean anything.
+    CHECK(mesh_parent > 0.005);
+    CHECK(mesh_child  < 0.95);
+    CHECK(mesh_child > mesh_parent * 1.5);
+
+    // And the same two chunks under the reference operator: no drift at all
+    // at the shared vertices, which is the whole point.
+    for (int y = 0; y <= kChunkQuads; y += 4) {
+        for (int x = 0; x <= kChunkQuads; x += 4) {
+            if (x > kChunkQuads / 4 || y > kChunkQuads / 4) continue;
+            CHECK(VertRock(gpd, x, y) == VertRock(gcd, x * 4, y * 4));
+        }
+    }
+}
+
+TEST_CASE("the reference slope is linear in the field's own amplitude") {
+    // A guard against the operator degenerating into something that is not
+    // a slope at all -- a clamp, a constant, or a value dominated by the
+    // ellipsoid rather than by the terrain. On a self-affine field the RMS
+    // slope is proportional to the relief the continuation is anchored on,
+    // so doubling `procedural_relief_m` must double the reference slope
+    // tangent while it is small enough not to be bent by the arctangent.
+    const PlanetSite site = PlanetSite::FromGeodetic(-0.3, 2.2);
+    const ChunkKey key{4, 12, 900u, 700u};
+    auto rms_tan = [&](double relief) {
+        ElevationField f = MakeProceduralField(relief, 20000.0);
+        std::vector<double> sl;
+        ReferenceSlope01(key, f, site, sl);
+        double acc = 0.0;
+        for (double s01 : sl) {
+            const double c = std::clamp(1.0 - s01, 1e-9, 1.0);
+            const double t = std::sqrt(std::max(0.0, 1.0 - c * c)) / c;
+            acc += t * t;
+        }
+        return std::sqrt(acc / static_cast<double>(sl.size()));
+    };
+    const double a = rms_tan(60.0);
+    const double b = rms_tan(120.0);
+    // Small enough that tan is still nearly its argument, large enough that
+    // the measurement is not floating-point dust.
+    CHECK(a > 0.005);
+    CHECK(b < 0.30);
+    CHECK(b / a == doctest::Approx(2.0).epsilon(0.02));
+
+    // And with the continuation switched off the reference slope collapses
+    // to the ONE residual the geometry has: world "up" is the GEOCENTRIC up
+    // (TerrainChunk.h's single documented approximation) while a bare
+    // ellipsoid surface follows the GEODETIC normal, and the two differ by
+    // the deflection of the vertical -- at most 11.5 arcmin. So a flat
+    // field reads at most 1 - cos(11.5 arcmin) and nothing more.
+    //
+    // Asserting the deflection rather than zero is the point: a check that
+    // a flat field reads zero would also pass on an implementation that
+    // returned zero unconditionally.
+    constexpr double kDeflectionCeil = 5.594e-6;      // 1 - cos(11.5 arcmin)
+    ElevationField flat = MakeProceduralField(0.0, 20000.0);
+    std::vector<double> sl;
+    ReferenceSlope01(key, flat, site, sl);
+    double worst_flat = 0.0;
+    for (double s01 : sl) {
+        CHECK(s01 <= kDeflectionCeil);
+        worst_flat = std::max(worst_flat, s01);
+    }
+    // 5.148e-6 on this chunk, i.e. 0.1839 deg of deflection -- present, and
+    // just inside the 0.1917 deg ceiling.
+    CHECK(worst_flat > 4.0e-6);
+    CHECK(worst_flat == doctest::Approx(5.148e-6).epsilon(2e-3));
+}
+
+TEST_CASE("the coarse area-mean branch tracks the pointwise branch it "
+          "prefilters") {
+    // Chunks coarser than kRefSlopeLevel cannot carry a 180 m signal, so
+    // they get the ramp's AREA MEAN against the slope distribution instead
+    // of a point sample of it. The two are the two halves of one mip chain,
+    // so they must agree in the mean where they meet.
+    for (double relief : {800.0, 1200.0, 1800.0}) {
+        ElevationField field = MakeProceduralField(relief, 20000.0);
+        const PlanetSite site = PlanetSite::FromGeodetic(0.1, 0.2);
+        const ChunkKey coarse{3, static_cast<std::uint8_t>(kRefSlopeLevel - 1),
+                              600u, 700u};
+        TerrainChunkData cd;
+        BuildTerrainChunk(coarse, field, site, cd);
+
+        double fine_sum = 0.0;
+        std::size_t fine_n = 0;
+        for (int dj = 0; dj < 2; ++dj) {
+            for (int di = 0; di < 2; ++di) {
+                const ChunkKey fine{coarse.face,
+                                    static_cast<std::uint8_t>(kRefSlopeLevel),
+                                    coarse.i * 2 + di, coarse.j * 2 + dj};
+                TerrainChunkData fd;
+                BuildTerrainChunk(fine, field, site, fd);
+                for (int y = 0; y <= kChunkQuads; ++y) {
+                    for (int x = 0; x <= kChunkQuads; ++x) {
+                        fine_sum += VertRock(fd, x, y);
+                        ++fine_n;
+                    }
+                }
+            }
+        }
+        double coarse_sum = 0.0;
+        std::size_t coarse_n = 0;
+        for (int y = 0; y <= kChunkQuads; ++y) {
+            for (int x = 0; x <= kChunkQuads; ++x) {
+                coarse_sum += VertRock(cd, x, y);
+                ++coarse_n;
+            }
+        }
+        const double fine_mean   = fine_sum / static_cast<double>(fine_n);
+        const double coarse_mean = coarse_sum / static_cast<double>(coarse_n);
+        // The band has to be somewhere the ramp is engaged, or agreeing at
+        // zero would count as agreeing.
+        CHECK(fine_mean > 0.02);
+        CHECK(fine_mean < 0.98);
+        // 0.06 is the measured envelope, not a round number: over the 40
+        // highest-relief land sites in earth_lite the coarse branch runs
+        // 0.035 below the pointwise mean on average with a p90 of 0.081.
+        // See kRefSlopeRmsGain -- the residual is the field's excess
+        // kurtosis against the Gaussian the Rayleigh model assumes, and it
+        // is recorded rather than tuned away.
+        CHECK(std::abs(coarse_mean - fine_mean) < 0.09);
+    }
+}
+
+TEST_CASE("the area-fraction integral is a distribution, not a curve fit") {
+    // Monotone, pinned at both ends, and equal to an independent
+    // rectangle-rule integration of the same Rayleigh integrand. The point
+    // is that RockFractionFromRmsSlope is the ramp averaged over a slope
+    // distribution and can be re-derived from that statement alone.
+    CHECK(RockFractionFromRmsSlope(0.0) == 0.0);
+    CHECK(RockFractionFromRmsSlope(-1.0) == 0.0);
+    double prev = -1.0;
+    for (double s = 0.02; s < 4.0; s += 0.02) {
+        const double v = RockFractionFromRmsSlope(s);
+        CHECK(v >= prev);
+        CHECK(v >= 0.0);
+        CHECK(v <= 1.0);
+        prev = v;
+    }
+    CHECK(RockFractionFromRmsSlope(8.0) > 0.97);
+
+    for (double s : {0.2, 0.45, 0.7, 1.0, 1.6}) {
+        const int n = 200000;
+        const double hi = 20.0 * s;
+        const double dt = hi / n;
+        double acc = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double t = (static_cast<double>(i) + 0.5) * dt;
+            const double slope01 = 1.0 - 1.0 / std::sqrt(1.0 + t * t);
+            const double pdf = t / (s * s) * std::exp(-0.5 * t * t / (s * s));
+            acc += SlopeRockFraction(slope01) * pdf * dt;
+        }
+        CHECK(RockFractionFromRmsSlope(s) == doctest::Approx(acc).epsilon(2e-3));
+        // Non-vacuous: the reference integral has to land strictly inside
+        // (0, 1) for the comparison to be worth making.
+        CHECK(acc > 0.001);
+        CHECK(acc < 0.999);
+    }
+}
+
+TEST_CASE("the reference operator is the one the threshold was measured "
+          "with") {
+    // Gabet, Pratt-Sitaula & Burbank (2004), Geology 32:629: a 3-arcsecond
+    // (~90 m) DEM, slope from the uphill and downhill neighbours. Both
+    // halves of that are pinned, because a threshold angle compared against
+    // a slope measured over some other baseline is a units error and the
+    // engine committed exactly that one.
+    const double arcsec3_m = 3.0 * (kIuggMeanRadius * 2.0 * 3.14159265358979323846)
+                           / (360.0 * 3600.0);
+    CHECK(arcsec3_m == doctest::Approx(92.66).epsilon(1e-3));
+    CHECK(kRefSlopeHalfLagM == doctest::Approx(90.0));
+
+    // kRefSlopeLevel is the CLOSEST level to that grid, in log2 -- the test
+    // is that no other level is closer, not that 11 is written down twice.
+    const double target = std::log2(arcsec3_m);
+    int best = -1;
+    double best_err = 1e30;
+    for (int l = 0; l <= kMaxLevel; ++l) {
+        const double err = std::abs(std::log2(ChunkVertexSpacing(l)) - target);
+        if (err < best_err) { best_err = err; best = l; }
+    }
+    CHECK(best == kRefSlopeLevel);
+    CHECK(ChunkVertexSpacing(kRefSlopeLevel) == doctest::Approx(76.35).epsilon(1e-3));
+
+    // The coarse branch's calibration, re-measured through the shipped
+    // constant so a silent edit to it fails here. The number is the
+    // least-squares fit of the per-axis RMS reference slope against
+    // relief * S(180 m) / 180 m over 216 level-11 chunks spread across all
+    // six cube faces of earth_lite.
+    ElevationField field = MakeProceduralField(900.0, 20000.0);
+    const double S = RelativeStructureFunction(2.0 * kRefSlopeHalfLagM,
+                                               20000.0,
+                                               field.Params().hillslope_break_m,
+                                               field.Params().hurst,
+                                               field.Params().hurst_fine);
+    CHECK(S > 0.0);
+    const double sigma = ReferenceRmsSlopePerAxis(field, glm::dvec3(0.0, 0.0, 1.0));
+    const double gain = sigma / (900.0 * S / (2.0 * kRefSlopeHalfLagM));
+    CHECK(gain == doctest::Approx(1.4689).epsilon(1e-3));
+}
+
+TEST_CASE("the reference-grid memo answers for the field it was filled from") {
+    // #307's bake evaluates the reference slope on the chunk's level-11
+    // ANCESTOR, which sixteen level-13 chunks share -- so the ancestor grid
+    // is memoised per worker thread rather than regenerated sixteen times.
+    // That memo is the one piece of state in an otherwise pure bake, and a
+    // cache that answers from the wrong field is precisely the defect class
+    // this file keeps catching. Three ways it could be wrong, all pinned.
+    const PlanetSite site = PlanetSite::FromGeodetic(0.4, 1.1);
+    const ChunkKey key{2, 13, 4936u, 9380u};      // a level-13 descendant
+
+    // (1) A MUTATED FIELD MUST NOT BE SERVED THE OLD GRID.
+    // The same ElevationField OBJECT, reconfigured in place -- which is what
+    // PlanetTerrain::Configure does when a cvar moves. The address is
+    // unchanged, so only the generation stamp can distinguish the two.
+    ElevationField mutating = MakeProceduralField(800.0, 20000.0);
+    TerrainChunkData before;
+    BuildTerrainChunk(key, mutating, site, before);
+
+    ElevationParams gentler = mutating.Params();
+    gentler.procedural_relief_m = 120.0;
+    const std::uint64_t gen_before = mutating.Generation();
+    mutating.SetParams(gentler);
+    CHECK(mutating.Generation() != gen_before);
+    TerrainChunkData after;
+    BuildTerrainChunk(key, mutating, site, after);
+
+    // The value a COLD cache produces. The memo is thread_local, so a
+    // freshly spawned thread has an empty one by construction -- there is
+    // no entry there to be served, stale or otherwise, and the comparison
+    // is therefore against the uncached path rather than against another
+    // possibly-stale hit. (Computing it on THIS thread would not do: a
+    // memo keyed on the chunk alone serves the same wrong grid to both
+    // sides and the equality passes while testing nothing. That is not
+    // hypothetical -- it is what this check did before the thread was
+    // added, and the reproduction is in the commit that added it.)
+    ElevationField fresh = MakeProceduralField(120.0, 20000.0);
+    TerrainChunkData reference;
+    {
+        std::thread cold([&] { BuildTerrainChunk(key, fresh, site, reference); });
+        cold.join();
+    }
+
+    std::size_t compared = 0, moved = 0, engaged_before = 0;
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            const double a = VertRock(before, x, y);
+            const double b = VertRock(after, x, y);
+            const double c = VertRock(reference, x, y);
+            CHECK(b == c);
+            if (a != b) ++moved;
+            if (a > 0.0 && a < 1.0) ++engaged_before;
+            ++compared;
+        }
+    }
+    // NOT VACUOUS. `b == c` over a field where the two params happen to
+    // agree proves nothing, so insist the reconfiguration actually moved
+    // the answer on a large fraction of the chunk AND that the pre-change
+    // value was in the ramp's transition band rather than pinned at an end.
+    // Without these, a memo that ignored the generation entirely would
+    // still pass every equality above.
+    CHECK(compared == static_cast<std::size_t>(kChunkVertexCount));
+    CHECK(moved > compared / 2u);
+    CHECK(engaged_before > compared / 20u);
+
+    // (1b) A COPY IS A DIFFERENT FIELD, AND MUST STAMP AS ONE.
+    // ElevationField is copied by value all over this file --
+    // MakeProceduralField returns one -- and the memo keys on the
+    // generation stamp ALONE, having dropped the object's address once the
+    // stamp was shown to subsume it. An implicit copy constructor would
+    // duplicate the stamp and hand two live objects the same identity.
+    // Asserted rather than left to the reasoning that a copy would serve
+    // the right grid anyway: that reasoning holds today and would fail
+    // silently the moment the class gained a mutable member.
+    ElevationField original = MakeProceduralField(800.0, 20000.0);
+    ElevationField copied(original);
+    ElevationField assigned = MakeProceduralField(120.0, 20000.0);
+    assigned = original;
+    CHECK(copied.Generation() != original.Generation());
+    CHECK(assigned.Generation() != original.Generation());
+    CHECK(assigned.Generation() != copied.Generation());
+    // ...and the copy still describes the same field, so it must bake the
+    // same chunk. A stamp that differs is only correct if the CONTENT
+    // agrees; without this the check above would pass on a copy
+    // constructor that dropped the params on the floor.
+    TerrainChunkData od, cd2;
+    BuildTerrainChunk(key, original, site, od);
+    BuildTerrainChunk(key, copied,   site, cd2);
+    std::size_t copy_engaged = 0;
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            CHECK(VertRock(od, x, y) == VertRock(cd2, x, y));
+            if (VertRock(od, x, y) > 0.0 && VertRock(od, x, y) < 1.0) ++copy_engaged;
+        }
+    }
+    CHECK(copy_engaged > static_cast<std::size_t>(kChunkVertexCount) / 20u);
+
+    // (2) TWO LIVE FIELDS MUST NOT SHARE AN ENTRY.
+    // Interleaved so that each bake finds the other's entry already in the
+    // cache; a memo keyed on the chunk alone would serve it.
+    ElevationField steep  = MakeProceduralField(800.0, 20000.0);
+    ElevationField shallow = MakeProceduralField(120.0, 20000.0);
+    TerrainChunkData s1, h1, s2, h2;
+    BuildTerrainChunk(key, steep,   site, s1);
+    BuildTerrainChunk(key, shallow, site, h1);
+    BuildTerrainChunk(key, steep,   site, s2);
+    BuildTerrainChunk(key, shallow, site, h2);
+    std::size_t differ = 0;
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            CHECK(VertRock(s1, x, y) == VertRock(s2, x, y));
+            CHECK(VertRock(h1, x, y) == VertRock(h2, x, y));
+            if (VertRock(s1, x, y) != VertRock(h1, x, y)) ++differ;
+        }
+    }
+    CHECK(differ > static_cast<std::size_t>(kChunkVertexCount) / 2u);
+
+    // (3) THE MEMO IS SMALLER THAN THE WORKING SET, SO IT MUST EVICT
+    // CORRECTLY. Sixteen distinct level-11 ancestors against a four-entry
+    // cache: every bake after the first four is a miss on a full cache, and
+    // a wrong eviction would hand back a NEIGHBOUR's grid rather than
+    // nothing.
+    //
+    // Each chunk is compared against the same chunk baked on its OWN fresh
+    // thread. The memo is thread_local, so that thread's cache is empty and
+    // its bake is provably a miss -- the uncached answer, by construction.
+    //
+    // THE OBVIOUS CHEAPER TEST DOES NOT WORK, and this file should say so
+    // because the trap is subtle. Baking the sixteen forwards and then
+    // backwards on ONE thread and comparing the two orders passes even when
+    // the ancestor coordinates are dropped from the cache key entirely:
+    // the first entry stays valid across both passes, so both orders read
+    // the SAME wrong grid and agree with each other. Two runs that are
+    // wrong in the same way are not a check. Measured: with the ancestor
+    // coordinates removed, order-vs-order gives 0 mismatches out of 16 and
+    // 15 of 16 chunks still differ from the first, so even the
+    // non-vacuity guard on that form is satisfied. The comparison has to be
+    // against a cache that cannot hold the wrong answer, not against
+    // another consultation of the one that does.
+    ElevationField field = MakeProceduralField(800.0, 20000.0);
+    std::size_t distinct_chunks = 0, engaged_total = 0;
+    std::vector<double> first_chunk;
+    for (int n = 0; n < 16; ++n) {
+        // BOTH halves of the ancestor key have to be separable, and the
+        // sequence is built so that each one is. The face alternates, so a
+        // same-(i, j) different-face pair is live in the cache at once; the
+        // coordinates advance every other chunk, so a same-face
+        // different-(i, j) pair is live too, and only two apart in a
+        // four-entry cache. A sweep that varied only one of the two would
+        // leave the other term untestable -- which is how the first draft
+        // of this case managed to pass with the coordinates removed from
+        // the key entirely.
+        const ChunkKey k{static_cast<std::uint8_t>(n % 2), 13,
+                         4936u + static_cast<std::uint32_t>(n / 2) * 4u,
+                         9380u + static_cast<std::uint32_t>(n / 2) * 4u};
+        // Warm: this thread, whose cache is already full of other
+        // ancestors from the bakes above and from earlier iterations.
+        TerrainChunkData warm;
+        BuildTerrainChunk(k, field, site, warm);
+        // Cold: a thread that has never baked anything.
+        TerrainChunkData cold;
+        {
+            std::thread t([&] { BuildTerrainChunk(k, field, site, cold); });
+            t.join();
+        }
+        std::vector<double> w, c;
+        for (int i = 0; i < kChunkVertexCount; ++i) {
+            const auto o = static_cast<std::size_t>(i) * kVertexPayloadFloats + 4;
+            w.push_back(warm.shader_verts[o]);
+            c.push_back(cold.shader_verts[o]);
+        }
+        CHECK(w == c);
+        if (n == 0) first_chunk = w;
+        else if (w != first_chunk) ++distinct_chunks;
+        for (double v : w) if (v > 0.0 && v < 1.0) ++engaged_total;
+    }
+    // Not vacuous: the sixteen chunks must actually differ from each other
+    // -- otherwise "the cache returned the right grid" is a statement about
+    // one grid -- and the ramp must be in its transition band somewhere, or
+    // an all-zero field would satisfy every equality above.
+    CHECK(distinct_chunks >= 14u);
+    CHECK(engaged_total > 1000u);
 }
