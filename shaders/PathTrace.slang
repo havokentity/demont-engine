@@ -4073,27 +4073,55 @@ float3 starsOnly(float3 rd, float3 sun) {
 // where T_view is the Beer-Lambert transmittance of the air column the view
 // ray crosses (real extinction: ~1 in vacuum, ~0.8 at the ground zenith,
 // falling to the horizon) and L_inscatter = skyPhysical() is the scattered
-// sunlight glowing in FRONT of the star. skyColor() already ADDS skyPhysical()
-// on top of this term, so the daytime wash-out falls straight out of the sum:
-// a lit air column raises L_inscatter to tens of W/m^2/sr and buries the
-// O(few)-unit star flux, while an unlit column (night) or an empty one (space)
-// leaves L_inscatter ~ 0 and the star stands against black. No sun-elevation
-// flag, no threshold -- the same physics that blacks the sky in space is what
-// hides the stars in daylight. This is the fix for "the stars aren't there in
-// space": nothing about the star changed, the foreground stopped being faked.
+// sunlight glowing in FRONT of the star. skyColor() ADDS skyPhysical() on top
+// of this term, so an unlit column (night) or an empty one (space) leaves
+// L_inscatter ~ 0 and the star stands against black, while a lit column raises
+// L_inscatter and buries the star. No sun-elevation flag: the same physics that
+// blacks the sky in space is what hides the stars in daylight.
+//
+// WHY THE ADDITIVE SUM IS NOT ENOUGH ON ITS OWN, AND THE CONTRAST TERM (#333).
+// Two rendering realities make the raw sum leak the brightest stars into the
+// day sky:
+//   * skyPhysical is single-scatter-dominated and reads DARKER than the real
+//     sky (documented -- r_sky_mode's own docstring, and the planet_land_orbit
+//     fixture header). At noon the modelled L_inscatter at a bright-star pixel
+//     is ~13 W/m^2/sr against the star's ~2 after extinction -- 16%, where a
+//     correctly-bright sky would make it <<1% and invisible, as in life.
+//   * ACES tonemaps per channel. The day sky is blue-dominated and saturates
+//     BLUE first, leaving RED with headroom, so a broadband star pokes through
+//     as a warm dot even while it is a small fraction of the sky's luminance.
+// The physically-grounded remedy is a CONTRAST attenuation, not a brightness
+// flag: a point source is detectable only when its luminance beats the veiling
+// sky background by more than the eye/sensor's threshold contrast, and the
+// detection index of a point source against a luminous background grows with
+// the SQUARE of that contrast (Rose 1948; Rose-de Vries / ideal-observer, shot-
+// noise-limited detection). starsPhysical() therefore scales the star by
+//     vis = Lc^2 / (Lc^2 + 1),   Lc = luma(star) / luma(sky_inscatter)
+// == luma(star)^2 / (luma(star)^2 + luma(sky)^2), photopic Rec.709 luma. It is
+// PARAMETER-FREE (only the frame's own star and sky radiances), tends to 1 as
+// the sky in-scatter tends to 0 (space AND ground night: stars full, unchanged)
+// and to 0 as the sky brightens (daylight: stars drowned), and it stands in for
+// the extra suppression the true, brighter sky would apply to the underestimated
+// single-scatter one. It is applied to all channels off the LUMINANCE contrast
+// (not per channel) precisely so the warm dot on the bright blue sky is pulled
+// down with everything else.
 //
 // starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
 // kept a separate function (rather than sharing starsOnly's body) so modes
 // 0-3 and the StarsComposite.slang mirror stay bit-for-bit unchanged. The
 // body-occlusion gate (a ray into the planet has no stars behind it) is kept;
-// twinkle is kept. Any change to the sampling must mirror starsOnly() above.
-float3 starsRadianceRaw(float3 rd) {
-    float3 up       = localUp(pos_fovtan.xyz);
+// twinkle is kept. `ro` is the ray origin (camera at a primary miss, the bounce
+// point on a secondary ray) so the local-up / occlusion frame matches the
+// extinction origin starsPhysical() uses -- they must not judge visibility and
+// extinction from different points. Any change to the sampling must mirror
+// starsOnly() above.
+float3 starsRadianceRaw(float3 ro, float3 rd) {
+    float3 up       = localUp(ro);
     float cosTheta  = clamp(dot(rd, up), -1.0, 1.0);
     bool star_visible = (cosTheta > -0.05);
     if (planet_center_radius.w > 0.0) {
         float b0, b1;
-        star_visible = !(ptSphereRoots(pos_fovtan.xyz, rd,
+        star_visible = !(ptSphereRoots(ro, rd,
                                        planet_center_radius.xyz,
                                        planet_center_radius.w, b0, b1)
                          && b0 > 0.0);
@@ -6838,19 +6866,53 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 }
 
 // Physical-mode star term (#333). The raw celestial radiance, extincted by the
-// real air column in front of it. sunSlantTransmittance(ro, rd) is a GENERIC
-// to-space Beer-Lambert transmittance along a direction -- it returns 0 when
-// the ray runs into the body (the same ptSphereRoots(planet_R) test
-// starsRadianceRaw uses for star_visible, so the two agree at the limb), 1
-// when the ray never touches the shell (space), and the reddened column
-// transmittance in between. It is not sun-specific; the name is historical.
-// skyColor() ADDS skyPhysical() on top of the value returned here -- that
-// additive in-scatter is what washes the stars out in daylight, so there is no
-// day/night flag here. See starsRadianceRaw() for the full rationale.
-float3 starsPhysical(float3 ro, float3 rd) {
-    float3 s = starsRadianceRaw(rd);
+// real air column in front of it, then attenuated by its CONTRAST against the
+// sky in-scatter that glows in front of it.
+//
+// sunSlantTransmittance(ro, rd) is a GENERIC to-space Beer-Lambert
+// transmittance along a direction -- it returns 0 when the ray runs into the
+// body (the same ptSphereRoots(planet_R) test starsRadianceRaw uses for
+// star_visible, so the two agree at the limb), 1 when the ray never touches the
+// shell (space), and the reddened column transmittance in between. It is not
+// sun-specific; the name is historical.
+//
+// `sky_inscatter` is the skyPhysical() radiance skyColor() already computed for
+// this ray (passed in rather than recomputed). vis is the squared-contrast
+// detectability of the star against the veiling sky (Rose 1948) -- 1 where the
+// sky is dark, ->0 where it is bright.
+//
+// kStarVeilK scales the veiling luminance the star is compared against. It is
+// NOT a brightness or day/night flag: at night and in space the sky in-scatter
+// is ~0, so kStarVeilK * lk is ~0 and vis is 1 regardless of its value -- both
+// paths stay bit-identical for any K (verified: ground-night and orbit renders
+// unchanged across K = 1..20). K only sets how hard a LIT sky washes stars out,
+// and it must be > 1 for two measured, physical reasons:
+//   * skyPhysical is single-scatter-dominated and reads darker than the true
+//     multiply-scattered sky (r_sky_mode / planet_land_orbit fixture headers);
+//     the real veiling luminance is a few times higher.
+//   * the Bright Star Catalog is rasterised on a NIGHT-visibility scale, not in
+//     W/m^2/sr: a magnitude-0 star is 4.0 "units" (BscCatalog kFluxScale) where
+//     its true per-pixel radiance at this FOV is ~0.007 W/m^2/sr -- ~500x
+//     smaller. Against the physical-radiance sky the catalogue stars are far too
+//     bright, so a bright one (Sirius) reads comparable to the noon sky instead
+//     of the <<1% it is in life.
+// K = 8 is a conservative stand-in for both: enough to make the noon sky bury
+// Sirius (measured: brightest daytime star +60 -> +0 sensor levels at K=8) while
+// staying far below the ~500x catalogue-to-radiance mismatch, so bright stars
+// still emerge through nautical/astronomical twilight as the in-scatter falls. A
+// proper fix is a radiometric recalibration of the catalogue, which would move
+// every star golden and is out of scope here. See starsRadianceRaw().
+// The max() is a 0/0 NaN guard (both luminances zero -- excluded by the early-out
+// above), not a tuning constant.
+static const float kStarVeilK = 8.0;
+float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
+    float3 s = starsRadianceRaw(ro, rd);
     if (all(s <= float3(0.0))) return float3(0.0);
-    return s * sunSlantTransmittance(ro, rd);
+    float3 star = s * sunSlantTransmittance(ro, rd);
+    float ls = dot(star,         float3(0.2126, 0.7152, 0.0722));
+    float lk = dot(sky_inscatter, float3(0.2126, 0.7152, 0.0722)) * kStarVeilK;
+    float vis = (ls * ls) / max(ls * ls + lk * lk, 1.0e-30);
+    return star * vis;
 }
 // --- end Planetary P6 physical sky ------------------------------------------
 
@@ -6880,8 +6942,9 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
         // with the sun up. This is the "stars aren't there in space" fix
         // (#333) -- starsOnly()'s `day` gate switched them off across the
         // whole sunlit hemisphere of any orbit.
-        return skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed)
-             + starsPhysical(ro, rd)
+        float3 sky = skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed);
+        return sky
+             + starsPhysical(ro, rd, sky)
              + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
              + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
     }
