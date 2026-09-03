@@ -605,11 +605,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     }
                 }
                 // Source chromaticity: the sun's RGB normalised by its own
-                // Rec.709 luminance. The luma coefficients sum to exactly 1,
-                // so a NEUTRAL source (R=G=B) gives sun_chroma = (1,1,1) and
-                // the composite below is byte-identical to the luminance-only
-                // version -- an orbital white sun stays white. A reddened low
-                // sun gives a chroma weighted to red. sun_lum * sun_chroma is
+                // Rec.709 luminance. A NEUTRAL source (R=G=B) divides all
+                // three channels by the same luma, so sun_chroma is
+                // ACHROMATIC and an orbital white sun stays white -- exactly,
+                // regardless of whether the luma coefficients sum to 1.0 in
+                // fp32. It is (1,1,1) to within ~1 ULP: div-then-mul does not
+                // round-trip exactly, so the residual is a common (colourless)
+                // factor ~1/(1+/-eps), not a colour shift, and cannot reach a
+                // golden (all pin r_lens_flare 0; capture reads pre-flare
+                // accum_hdr). A reddened low sun gives a chroma weighted to
+                // red. sun_lum * sun_chroma is
                 // algebraically sun_rgb (the source radiance); it is written
                 // factored so the magnitude that drives exposure survival
                 // (sun_lum) and the colour it carries (sun_chroma) read
@@ -761,8 +766,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 // starburst (both are summed into `flare`) with the source's
                 // colour, with each ghost's Abbe-number dispersion (the
                 // per-channel Gaussian offsets in `flare`) modulating on top;
-                // a neutral sun leaves sun_chroma = (1,1,1) and this line
-                // byte-identical to the pre-chromaticity composite.
+                // a neutral sun leaves sun_chroma achromatic (= (1,1,1) to
+                // within ~1 ULP) so this line matches the pre-chromaticity
+                // composite up to a sub-ULP colourless factor -- no tint.
                 // sun_body_vis is the geometric limb-occlusion gate
                 // (engine-side ray-vs-body): it kills the flare when the
                 // sun is behind the planet even though a bright sunlit
