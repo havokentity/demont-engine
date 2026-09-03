@@ -148,10 +148,19 @@ cbuffer Push {
     // units. Each ghost scales this by its own size factor so
     // mirrors-near-centre are tighter than mirrors-far-out.
     float flare_size;
+    // Geometric sun visibility: the fraction of the solar disc still
+    // clear of the planet's limb, computed engine-side from the
+    // camera->sun ray vs the planet body sphere (0 = disc entirely
+    // behind the body, 1 = entirely in open sky). Multiplies the
+    // physical flare so ghosts are NOT drawn from a sun the body
+    // geometrically occludes -- the case the luminance gate alone
+    // cannot tell from a bright sunlit cloud sitting at sun_uv. Doubles
+    // as the 4-byte pad that lands the following float2 sun_uv on an
+    // 8-byte boundary (it replaced the old _pad_sun_align, same offset).
+    float sun_body_vis;
     // Sun's screen UV (computed engine-side from sun_dir + camera
     // basis). Sentinel (-2, -2) means sun is behind / off-screen
     // so the flare loop is skipped.
-    float _pad_sun_align;
     float2 sun_uv;
     // 'physical' flare mode: gather per-channel Gaussian splats from
     // ghosts[]. Each ghost's screen UV is sun_uv_centred * scale
@@ -537,10 +546,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // rainbow fringe along ghost edges. No bloom sampling.
         //
         // Three physical effects layered on top:
-        //   - sun-visibility gate from sampling hdr_in at sun_uv (so
-        //     the flare disappears when the sun is below the horizon
-        //     or occluded by scene geometry -- no explicit night-time
-        //     gate needed)
+        //   - a TWO-part sun-visibility gate: (1) a luminance gate
+        //     sampling hdr_in at sun_uv, which fades the flare as the sun
+        //     dims below the horizon (no explicit night-time gate needed),
+        //     and (2) a geometric limb gate, sun_body_vis, computed
+        //     engine-side by testing the camera->sun ray against the
+        //     planet body sphere. The luminance gate alone cannot tell an
+        //     up-but-hidden sun from a bright sunlit cloud or ocean glint
+        //     sitting at the sun's projected UV, so it would draw ghosts
+        //     from a sun the body occludes; the geometric gate is what
+        //     actually makes the flare self-extinguish behind the limb.
+        //     LIMITATION: sun_body_vis tests only the planet BODY (one
+        //     sphere) and ignores atmospheric refraction (~0.5 deg lift at
+        //     the horizon); a non-body foreground occluder at sun_uv is
+        //     still not depth-tested (#337 follow-up).
         //   - hexagonal ghost silhouettes from approximating the
         //     aperture stop's blade shape (real lenses have blade
         //     count = 5..8; we hardcode 6)
@@ -744,8 +763,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 // per-channel Gaussian offsets in `flare`) modulating on top;
                 // a neutral sun leaves sun_chroma = (1,1,1) and this line
                 // byte-identical to the pre-chromaticity composite.
+                // sun_body_vis is the geometric limb-occlusion gate
+                // (engine-side ray-vs-body): it kills the flare when the
+                // sun is behind the planet even though a bright sunlit
+                // cloud or ocean glint at sun_uv keeps the luminance gate
+                // `vis` open. The two multiply -- both the luminance
+                // (below-horizon dimming) and the geometry (body occlusion)
+                // must agree the sun is up for a ghost to draw.
                 c += flare_intensity * sun_lum * sun_chroma
-                   * flare * fade * vis * sun_off;
+                   * flare * fade * vis * sun_off * sun_body_vis;
             }
             // Passthrough path still needs sRGB OETF on SPIR-V swapchains
             // (BGRA8_UNORM) -- without it the linear LDR `c` reaches the

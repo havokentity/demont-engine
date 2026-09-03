@@ -14476,14 +14476,20 @@ void Engine::RenderFrame() {
             float        flare_threshold;
             std::uint32_t flare_mode_sun;   // 1 = explicit sun-position flare
             float        flare_size;        // sun mode: ghost disc base radius
-            // CRITICAL: 4-byte alignment padding so the following
-            // float2 sun_uv lands at an 8-byte boundary on Metal.
-            // Without this, the MSL compiler inserts implicit padding
-            // before float2 -- but the C++ side doesn't, so the
-            // shader reads bytes from the wrong offset (got
-            // sun_uv = (engine.y, 0), making the crosshair stick to
-            // the top-left edge regardless of where the sun is).
-            float        _pad_sun_align;
+            // Geometric sun-visibility gate: the fraction of the solar
+            // disc still clear of the planet's limb (0 = fully behind the
+            // body, 1 = fully in open sky), computed below by testing the
+            // camera->sun ray against the planet body sphere. Consumed by
+            // the physical-flare composite in Tonemap.slang.
+            //
+            // It also serves as the 4-byte alignment pad that lands the
+            // following float2 sun_uv on an 8-byte boundary (it replaced
+            // the old _pad_sun_align at the SAME offset -- layout,
+            // sizeof and the offsetof(ghosts)==112 assert are unchanged).
+            // Without a 4-byte field here the MSL compiler inserts
+            // implicit padding before float2 that the C++ side doesn't,
+            // and the shader would read sun_uv from the wrong offset.
+            float        sun_body_vis;
             float        sun_uv[2];         // 8-byte aligned; matches MSL float2
             // Physical-flare extension. flare_mode_physical = 1 routes
             // the shader to gather Gaussian splats from the ghosts[]
@@ -14604,6 +14610,74 @@ void Engine::RenderFrame() {
         tp.flare_size       = flare_size;
         tp.sun_uv[0]        = sun_uv_x;
         tp.sun_uv[1]        = sun_uv_y;
+
+        // Geometric sun-occlusion gate (occlusion-honesty finding on the
+        // sun-lensflare PR). The shader's luminance gate infers sun
+        // visibility from the brightness sampled at the projected sun_uv,
+        // which a bright sunlit cloud or an ocean sun-glint sitting exactly
+        // where the (hidden) sun projects can spoof -- so the physical flare
+        // would draw ghosts from a sun the planet body geometrically
+        // occludes. The physical-mode comment CLAIMED the flare
+        // "self-extinguishes when the sun is occluded"; the luminance sample
+        // never actually performed that test. Do it here, cheaply and for
+        // real: intersect the camera->sun ray with the planet body.
+        //
+        // The body is the one sphere the atmosphere and the analytic ground
+        // already share -- push.planet_center_radius (centre in the render
+        // frame, radius in .w). Both it and the camera position
+        // (push.pos_fovtan) are in the same camera-anchored render frame
+        // (#255), and push.sun_and_mode.xyz is a unit vector toward the sun.
+        //
+        // sun_body_vis is the fraction of the solar disc still clear of the
+        // limb: 1 when the disc is entirely in open sky, 0 when entirely
+        // behind the body, smoothly ramped across the limb over the disc's
+        // own angular diameter so the flare fades rather than popping.
+        //
+        // BASIS / LIMITATIONS, stated honestly: this is the GEOMETRIC limb
+        // (ray vs. body sphere). Atmospheric refraction, which lifts the low
+        // sun ~0.5 deg, is NOT modelled -- the residual near-limb dimming it
+        // would matter for is already carried by the shader's luminance gate,
+        // which multiplies this one. It tests only the planet body, not
+        // arbitrary foreground occluders (that needs the depth buffer at
+        // sun_uv -- a #337 follow-up). The body is a sphere, not the WGS-84
+        // ellipsoid, so the limb is off by the ~0.3% flattening; negligible
+        // for a flare gate.
+        float sun_body_vis = 1.0f;
+        {
+            const float body_R = push.planet_center_radius[3];
+            if (body_R > 0.0f) {
+                const glm::vec3 cam_p{push.pos_fovtan[0], push.pos_fovtan[1],
+                                      push.pos_fovtan[2]};
+                const glm::vec3 body_c{push.planet_center_radius[0],
+                                       push.planet_center_radius[1],
+                                       push.planet_center_radius[2]};
+                const glm::vec3 sun_d{push.sun_and_mode[0], push.sun_and_mode[1],
+                                      push.sun_and_mode[2]};   // unit, toward sun
+                const glm::vec3 to_body = body_c - cam_p;      // camera -> centre
+                const float d = glm::length(to_body);
+                if (d > body_R) {                              // camera outside body
+                    // Angle between the sun direction and the direction to
+                    // the body centre.
+                    const float cos_gamma =
+                        glm::clamp(glm::dot(to_body, sun_d) / d, -1.0f, 1.0f);
+                    const float gamma = std::acos(cos_gamma);
+                    // Angular radius the body subtends from the camera.
+                    const float alpha_body =
+                        std::asin(glm::clamp(body_R / d, 0.0f, 1.0f));
+                    // Sun's own angular radius: 0.00465 rad (0.2666 deg) --
+                    // kSunAngularRadius in shaders/PathTraceMath.slang. The
+                    // disc crosses the limb over 2*alpha_sun of angular travel.
+                    constexpr float alpha_sun = 0.00465f;
+                    // Visible fraction of the disc above the limb: 0 when the
+                    // sun direction is within (alpha_body - alpha_sun) of the
+                    // centre (disc fully behind), 1 beyond (alpha_body +
+                    // alpha_sun) (disc fully clear), smooth between.
+                    sun_body_vis = glm::smoothstep(alpha_body - alpha_sun,
+                                                   alpha_body + alpha_sun, gamma);
+                }
+            }
+        }
+        tp.sun_body_vis = sun_body_vis;
 
         // Physical-mode ghost packing. Per-frame work: viewport-scaled
         // pixel radii for each of the precomputed ghost matrices,
