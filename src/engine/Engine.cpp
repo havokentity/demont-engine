@@ -805,7 +805,7 @@ namespace cvar {
     PT_CVAR(r_lens_dirt_strength, "0.6", "How strongly the dirt field is mixed into the bloom modulation (0..1). 0 = clean (dirt has no effect even when r_lens_dirt is on); 1 = the dirt field fully gates the bloom (dark grime kills bloom there, bright smudges boost it). 0.6 is a tasteful default streaky-but-readable look.", CVAR_ARCHIVE);
     // --- end Wave 10 bloom/bokeh ---
     PT_CVAR(r_lens_flare,      "0",   "Lens flare. Image-based ghost reflections sampled from the bloom layer at mirror-across-centre positions. 0 disables.", CVAR_ARCHIVE);
-    PT_CVAR(r_lens_flare_intensity, "0.15", "Linear blend strength of the flare layer. Real-camera lens flare is typically 0.1-0.3 of the bright source.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_intensity, "0.15", "Flare layer strength. In 'sun'/'image' modes this is the whole blend factor of the flare against the tonemap-relative image (0.1-0.3 of the bright source). In 'physical' mode the flare is scaled by the SOURCE's own luminance times each ghost's absolute Fresnel fraction, so this is a pure look gain on a physically-grounded magnitude -- useful range there is ~0.02-0.08 (the earth scene seeds 0.04); 0.15 in physical mode saturates the brightest ghosts to white.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..6). Each ghost has a different scale + colour tint hardcoded in the shader.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_threshold, "0.0", "(image mode only) Per-ghost luminance gate. 0 = no gate. 'sun' mode ignores this and draws clean sun-only flare.", CVAR_ARCHIVE);
@@ -2631,6 +2631,28 @@ bool Engine::Init() {
     lens_main_path_   = lensflare::trace_main_path(lens_system_);
     LOG_INFO("Lens flare: traced {} ghost paths (main B = {:.2f} mm)",
              lens_ghost_count_, lens_main_path_.B_g);
+    // One-shot dump of the packed shader ghosts at a 1080p reference
+    // viewport. Cheap (runs once), and the numbers are exactly what the
+    // tonemap flare loop consumes: per-channel sun_uv scale (the ghost's
+    // position on the sun->centre axis, so this is also how you verify the
+    // projection tracks the sun), the ABSOLUTE Fresnel/transmittance
+    // fraction the ghost returns (now un-normalised -- see LensFlare.cpp),
+    // and the splat radius in pixels. Gated behind PT_LENSFLARE_DUMP so it
+    // stays quiet unless asked for.
+    if (std::getenv("PT_LENSFLARE_DUMP") != nullptr) {
+        lensflare::ShaderGhost dbg[lensflare::kMaxGhosts];
+        const int nd = lensflare::prepare_shader_ghosts(
+            lens_system_, lens_ghosts_, lens_ghost_count_,
+            lens_main_path_, 1080, dbg, lensflare::kMaxGhosts);
+        LOG_INFO("Lens flare dump: {} shader ghosts @1080p "
+                 "(scale_rgb, fresnel_frac, radius_px):", nd);
+        for (int g = 0; g < nd; ++g) {
+            LOG_INFO("  ghost[{}] scale=({:.4f},{:.4f},{:.4f}) "
+                     "fresnel={:.3e} radius_px={:.1f}",
+                     g, dbg[g].scale_r, dbg[g].scale_g, dbg[g].scale_b,
+                     dbg[g].intensity, dbg[g].radius_px);
+        }
+    }
 
     // P11 persistence: replay last session's archived cvars first, then
     // the user's autoexec.cfg. Both are exec'd as plain console scripts
@@ -2978,6 +3000,56 @@ bool Engine::Init() {
         // moving. Verified a no-op: seed_cvar only writes when the cvar
         // is unassigned, and it writes the value it already holds.
         seed_cvar("r_show_stars", "1");
+        // --- The camera's response to a real sun (sun-lensflare) ----------
+        //
+        // From orbit there is no air between the lens and the sun, so the
+        // sun is a small, sharp, blindingly bright disc -- and everything
+        // "spectacular" about the ISS view is the CAMERA responding to it,
+        // not the disc itself being inflated. Two real optical phenomena
+        // carry that response, and both already exist in the tonemap pass:
+        //
+        //   * bloom -- the sensor's own glare around a source that pins the
+        //     pixel far past full-well. Already ON in this scene (r_bloom's
+        //     registered default is 1 and the seed leaves it there), so the
+        //     only thing missing was the flare.
+        //   * lens flare -- ghost reflections off the internal element
+        //     surfaces of the taking lens. r_lens_flare defaults OFF (it is
+        //     a look the whole engine should not wear by default), so a
+        //     cold-start planet had none. Seed it ON here, in physical mode
+        //     (the registered default of r_lens_flare_mode): the ghosts are
+        //     the paraxial Hullin et al. 2011 lens model of a real 4-element
+        //     50mm lens (src/engine/LensFlare.cpp), positioned per-channel
+        //     by each glass element's Abbe number -- NOT a painted sprite.
+        //     The shader gates the whole effect on the sun's on-screen
+        //     luminance, so it self-extinguishes when the sun sets or is
+        //     occluded (no separate night gate). See shaders/Tonemap.slang.
+        //
+        // LEAK AUDIT (the r_planet_terrain trap above, restated). seed_cvar
+        // writes only when the cvar is unassigned, so this seed can only
+        // reach a fixture that left r_lens_flare unstated. Every golden that
+        // reaches this block -- the r_scene_default=earth cells, and the
+        // spheres_csg-based _late.cfg pairs that inherit it -- already pins
+        // BOTH r_lens_flare 0 and r_bloom 0, so this seed moves no golden on
+        // its own (verified across tests/goldens/scenes). The flare's own
+        // sub-parameters (intensity/count) are dead in every golden for the
+        // same reason: the flare loop is gated behind r_lens_flare, which is
+        // 0 in all of them, so their values never reach a rendered pixel.
+        seed_cvar("r_lens_flare", "1");
+        // ISS-tuned flare look. In physical mode the flare magnitude is
+        // sun_lum * fresnel_fraction * r_lens_flare_intensity (Tonemap.slang),
+        // so r_lens_flare_intensity is a pure look gain against the source's
+        // own luminance -- NOT the whole magnitude the way it is in the
+        // sun/image modes (which is why its registered default of 0.15 is
+        // left alone for those). 0.04 puts the brightest few ghosts near the
+        // clip (a real sun's brightest ghosts DO saturate) while the fainter
+        // ones in the train keep their disc shape. r_lens_flare_count 8 draws
+        // enough of the 15 enumerated ghost paths to read as a train that
+        // crosses the sun->centre axis, rather than the 4 (all same-side)
+        // that the registered default shows. Both are dead in every golden
+        // (flare is gated off there) and invisible to the accum capture, so
+        // they move nothing -- they only set the live default planet's look.
+        seed_cvar("r_lens_flare_intensity", "0.04");
+        seed_cvar("r_lens_flare_count", "8");
         // The planet IS the scene; the historical grey plane at y = 0
         // would sit above the ellipsoid everywhere except the tangent
         // point and paint a flat-Earth horizon over it -- the same reason

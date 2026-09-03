@@ -627,10 +627,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     float iR = exp(-qR * qR);
                     float iG = exp(-qG * qG);
                     float iB = exp(-qB * qB);
-                    // Brightness scales with ghost intensity (Fresnel
-                    // product) and a uniform 4x boost so the ghosts
-                    // are visible at typical r_lens_flare_intensity.
-                    flare += float3(iR, iG, iB) * (gi_int * 4.0);
+                    // Brightness is the ghost's ABSOLUTE Fresnel/
+                    // transmittance fraction (gi_int, ~1e-3..1e-5 from
+                    // LensFlare.cpp). It is multiplied by the source's
+                    // own luminance (sun_lum) at composite below, so the
+                    // ghost radiance is literally source_radiance * the
+                    // path's double-reflection loss -- no arbitrary boost
+                    // and no dependence on the exposure the scene meters
+                    // at. (The old uniform 4x was the boost that made a
+                    // [0,1]-normalised intensity visible; it is gone with
+                    // the normalisation.)
+                    flare += float3(iR, iG, iB) * gi_int;
                 }
 
                 // Aperture diffraction starburst: 6-pointed star at the
@@ -651,8 +658,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     // Slight blue tint: Rayleigh-scattered diffraction
                     // is wavelength dependent, blue dominates short-r
                     // and fades faster than red at longer distances.
+                    //
+                    // kStarburstFrac is the peak fraction of the source
+                    // that the aperture-diffraction spikes carry, in the
+                    // SAME absolute units as the ghost gi_int above so the
+                    // shared * sun_lum at composite scales both together.
+                    // 2e-3 sits just above the brightest ghost's Fresnel
+                    // product, which is where a 6-blade iris's spikes read
+                    // on a real sun -- a touch hotter than the ghosts at
+                    // the core, gone within a fraction of the frame.
+                    const float kStarburstFrac = 2.0e-3;
                     float3 starburst = float3(0.95, 0.97, 1.05)
-                                     * spike * fall * 1.8;
+                                     * spike * fall * kStarburstFrac;
                     flare += starburst;
                 }
 
@@ -668,7 +685,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 // to off-axis angle. Without this fade the ghosts pile
                 // up into one giant blob centred on the sun.
                 float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
-                c += flare_intensity * flare * fade * vis * sun_off;
+                // sun_lum carries the physics: the flare is the source's
+                // own luminance times each path's absolute Fresnel loss
+                // (gi_int) times the artistic gain flare_intensity. Because
+                // it scales with the source and is added in the same linear
+                // HDR that the exposure multiplies next, the flare is a
+                // fixed FRACTION of the (clipped) sun at ANY exposure --
+                // which is what makes it survive the scene's auto-exposure
+                // instead of vanishing under the ~0.02 an orbital frame
+                // meters at. flare_intensity is now a pure look gain (~1 =
+                // the unattenuated Fresnel fraction) rather than the whole
+                // magnitude. See LensFlare.cpp on why gi_int is absolute.
+                c += flare_intensity * sun_lum * flare * fade * vis * sun_off;
             }
             // Passthrough path still needs sRGB OETF on SPIR-V swapchains
             // (BGRA8_UNORM) -- without it the linear LDR `c` reaches the

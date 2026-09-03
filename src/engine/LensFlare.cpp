@@ -262,11 +262,20 @@ int trace_ghosts(const LensSystem& lens, Ghost* out, int max_count) {
     const int n_out = std::min(num, max_count);
     if (n_out == 0) return 0;
 
-    // Normalize intensities to [0, 1] keyed on the brightest ghost.
-    // The engine's r_lens_flare_intensity cvar is the absolute scale.
-    float max_int = cands[0].intensity;
-    if (max_int < 1.0e-12f) max_int = 1.0e-12f;
-
+    // Intensity is the ABSOLUTE double-reflection Fresnel/transmittance
+    // fraction of the source that this ghost returns to the sensor -- the
+    // product R_i * R_j * T computed in ghost_intensity(), typically
+    // ~1e-3 for the brightest ghost down to ~1e-5 for the faint ones. It
+    // is deliberately NOT normalised to the brightest ghost: the physical
+    // flare in Tonemap.slang multiplies each ghost by the sun's own
+    // on-screen luminance (~1.6e6 W/m^2/sr for the physical disc at orbit,
+    // #280), so the rendered ghost radiance is source_radiance * this
+    // fraction. That product is what keeps the flare a fixed, physically
+    // grounded fraction of the source under ANY exposure -- the whole
+    // point, because the default earth scene meters with auto-exposure and
+    // a magnitude baked for one exposure would be wrong at every other.
+    // Normalising to 1 here would have thrown the absolute fraction away
+    // and forced a magic per-scene brightness constant back in the shader.
     for (int g = 0; g < n_out; ++g) {
         const Candidate& c = cands[g];
         Ghost& gh = out[g];
@@ -276,7 +285,7 @@ int trace_ghosts(const LensSystem& lens, Ghost* out, int max_count) {
         gh.M_g[2] = c.M_g.c; gh.M_g[3] = c.M_g.d;
         gh.M_b[0] = c.M_b.a; gh.M_b[1] = c.M_b.b;
         gh.M_b[2] = c.M_b.c; gh.M_b[3] = c.M_b.d;
-        gh.intensity = c.intensity / max_int;
+        gh.intensity = c.intensity;   // absolute Fresnel fraction (see above)
         // Footprint radius. A parallel bundle (u_in = sun angle) of
         // height range [-r_p, r_p] passes through the ghost transfer
         // matrix to (A*h_in + B*u_in, ...), so the bundle's HEIGHT
