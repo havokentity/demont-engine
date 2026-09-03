@@ -575,11 +575,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     }
                 }
                 // Higher-order Reinhard centred on sun_lum = 5 (between
-                // a bright wall ~1 and the un-occluded sun ~50). Smooth
+                // a bright wall ~1 and the un-occluded sun). Smooth
                 // transition: ~0 below threshold, ~1 above.
-                float L = sun_lum / 5.0;
-                L = L * L; L = L * L; L = L * L; L = L * L;   // ^16
-                float vis = L / (L + 1.0);
+                //
+                // Computed as the OVERFLOW-SAFE reciprocal of L/(L+1) with
+                // L = (sun_lum/5)^16. The physical sun disc is sun_lum ~
+                // 1.59e6 (E/Omega, #280), so L ~ 1e88 overflows fp32 (max
+                // 3.4e38) to +Inf and the direct form gives vis =
+                // Inf/(Inf+1) = NaN -- uniform across the frame, so 0*NaN
+                // NaNs every pixel and saturate(NaN)->0 renders the whole
+                // swapchain BLACK the instant the sun (or any >~1280-lum
+                // highlight) sits at sun_uv. The identity
+                // L/(L+1) = 1/(1 + (5/sun_lum)^16) is bit-equivalent in the
+                // finite range but cannot overflow: a bright sun drives
+                // inv -> 0 (vis -> 1); a dark sample drives inv -> +Inf,
+                // giving vis = 1/(1+Inf) = 0 (correctly gated off, no NaN).
+                float inv = 5.0 / max(sun_lum, 1e-8);
+                inv = inv * inv; inv = inv * inv; inv = inv * inv; inv = inv * inv;  // (5/sun_lum)^16
+                float vis = 1.0 / (1.0 + inv);
 
                 // Cap by both the engine-side ghost count and the user-
                 // controlled r_lens_flare_count slider so the slider

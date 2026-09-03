@@ -807,7 +807,7 @@ namespace cvar {
     PT_CVAR(r_lens_flare,      "0",   "Lens flare. Image-based ghost reflections sampled from the bloom layer at mirror-across-centre positions. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_intensity, "0.15", "Flare layer strength. In 'sun'/'image' modes this is the whole blend factor of the flare against the tonemap-relative image (0.1-0.3 of the bright source). In 'physical' mode the flare is scaled by the SOURCE's own luminance times each ghost's absolute Fresnel fraction, so this is a pure look gain on a physically-grounded magnitude -- useful range there is ~0.02-0.08 (the earth scene seeds 0.04); 0.15 in physical mode saturates the brightest ghosts to white.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
-    PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..6). Each ghost has a different scale + colour tint hardcoded in the shader.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..16, clamped to kPhysGhostMax/kMaxGhosts in the shader). Each ghost has a different scale + colour tint hardcoded in the shader. The earth default scene seeds 8.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_threshold, "0.0", "(image mode only) Per-ghost luminance gate. 0 = no gate. 'sun' mode ignores this and draws clean sun-only flare.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_mode, "physical", "Lens flare algorithm. 'physical' = Hullin paraxial: ghosts come from a real 4-element 50mm lens model, with per-channel chromatic dispersion derived from each glass element's Abbe number. 'sun' = simpler explicit sun-position flare: projects the sun direction to screen and draws soft Gaussian-disc ghosts at its mirrored positions (clean, no scene mirroring). 'image' = legacy image-based flare: mirror-samples the full bloom mip at every output pixel.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_size, "0.04", "(sun mode) Ghost disc radius in fractions of screen *height*. 0.02 = ~22 px on 1080p, 0.08 = ~86 px. Default 0.04 (~43 px) gives discrete circular discs. Aspect-correct -- discs stay round on any aspect ratio.", CVAR_ARCHIVE);
@@ -18256,7 +18256,9 @@ void Engine::RegisterCommands() {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_lens_flare_mode")) {
-        v->allowed_values = {"sun", "image"};
+        // "physical" is the registered default AND what the earth scene
+        // seeds; omitting it here made it unselectable once changed away.
+        v->allowed_values = {"physical", "sun", "image"};
     }
     if (auto* v = C.FindCVar("r_debug_sun_overlay")) {
         v->allowed_values = {"0", "1"};
