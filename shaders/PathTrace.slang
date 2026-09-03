@@ -4090,21 +4090,20 @@ float3 starsOnly(float3 rd, float3 sun) {
 //   * ACES tonemaps per channel. The day sky is blue-dominated and saturates
 //     BLUE first, leaving RED with headroom, so a broadband star pokes through
 //     as a warm dot even while it is a small fraction of the sky's luminance.
-// The physically-grounded remedy is a CONTRAST attenuation, not a brightness
-// flag: a point source is detectable only when its luminance beats the veiling
-// sky background by more than the eye/sensor's threshold contrast, and the
-// detection index of a point source against a luminous background grows with
-// the SQUARE of that contrast (Rose 1948; Rose-de Vries / ideal-observer, shot-
-// noise-limited detection). starsPhysical() therefore scales the star by
-//     vis = Lc^2 / (Lc^2 + 1),   Lc = luma(star) / luma(sky_inscatter)
-// == luma(star)^2 / (luma(star)^2 + luma(sky)^2), photopic Rec.709 luma. It is
-// PARAMETER-FREE (only the frame's own star and sky radiances), tends to 1 as
-// the sky in-scatter tends to 0 (space AND ground night: stars full, unchanged)
-// and to 0 as the sky brightens (daylight: stars drowned), and it stands in for
-// the extra suppression the true, brighter sky would apply to the underestimated
-// single-scatter one. It is applied to all channels off the LUMINANCE contrast
-// (not per channel) precisely so the warm dot on the bright blue sky is pulled
-// down with everything else.
+// The remedy is a CONTRAST attenuation, not a brightness flag: a point source is
+// detectable only when its luminance beats the veiling sky background by more
+// than the eye/sensor's threshold contrast, and the detection index of a point
+// source against a luminous background grows with the SQUARE of that contrast
+// (Rose 1948; Rose-de Vries / ideal-observer, shot-noise-limited detection).
+// Rose gives the FORM, not a value. starsPhysical() scales the star by
+//     vis = ls^2 / (ls^2 + (K * lk)^2),   ls = luma(star*T), lk = luma(sky)
+// photopic Rec.709 luma, K = kStarVeilK (see starsPhysical() below for what K is
+// and why it is NOT parameter-free -- it is a veiling factor that balances a
+// deliberate rendering choice, tracked for removal by issue #338). vis tends to
+// 1 as the sky in-scatter tends to 0 (space AND ground night: stars full,
+// unchanged, for ANY K) and to 0 as the sky brightens (daylight: stars drowned).
+// It is applied to all channels off the LUMINANCE contrast (not per channel)
+// precisely so the warm dot on the bright blue sky is pulled down with the rest.
 //
 // starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
 // kept a separate function (rather than sharing starsOnly's body) so modes
@@ -6881,29 +6880,32 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 // detectability of the star against the veiling sky (Rose 1948) -- 1 where the
 // sky is dark, ->0 where it is bright.
 //
-// kStarVeilK scales the veiling luminance the star is compared against. It is
-// NOT a brightness or day/night flag: at night and in space the sky in-scatter
-// is ~0, so kStarVeilK * lk is ~0 and vis is 1 regardless of its value -- both
-// paths stay bit-identical for any K (verified: ground-night and orbit renders
-// unchanged across K = 1..20). K only sets how hard a LIT sky washes stars out,
-// and it must be > 1 for two measured, physical reasons:
-//   * skyPhysical is single-scatter-dominated and reads darker than the true
-//     multiply-scattered sky (r_sky_mode / planet_land_orbit fixture headers);
-//     the real veiling luminance is a few times higher.
-//   * the Bright Star Catalog is rasterised on a NIGHT-visibility scale, not in
-//     W/m^2/sr: a magnitude-0 star is 4.0 "units" (BscCatalog kFluxScale) where
-//     its true per-pixel radiance at this FOV is ~0.007 W/m^2/sr -- ~500x
-//     smaller. Against the physical-radiance sky the catalogue stars are far too
-//     bright, so a bright one (Sirius) reads comparable to the noon sky instead
-//     of the <<1% it is in life.
-// K = 8 is a conservative stand-in for both: enough to make the noon sky bury
-// Sirius (measured: brightest daytime star +60 -> +0 sensor levels at K=8) while
-// staying far below the ~500x catalogue-to-radiance mismatch, so bright stars
-// still emerge through nautical/astronomical twilight as the in-scatter falls. A
-// proper fix is a radiometric recalibration of the catalogue, which would move
-// every star golden and is out of scope here. See starsRadianceRaw().
-// The max() is a 0/0 NaN guard (both luminances zero -- excluded by the early-out
-// above), not a tuning constant.
+// kStarVeilK is a TUNED veiling factor, not a derived or parameter-free constant.
+// It exists to balance a DELIBERATE rendering choice against daytime contrast:
+// the Bright Star Catalog is rasterised on a NIGHT-VISIBILITY scale, not in
+// W/m^2/sr. A magnitude-0 star is 4.0 "units" (BscCatalog kFluxScale) where its
+// true per-pixel radiance at this FOV is ~0.007 W/m^2/sr -- ~500x smaller -- and
+// the boost is intentional: a physically-scaled star renders as nothing under
+// the ACES tonemap, so the raster is pushed up until stars are visible at night.
+// That same boost makes a bright star (Sirius) read comparable to the (itself
+// single-scatter-underestimated) noon sky in linear light, so the raw contrast
+// leaks it into daylight. K is the multiplier on the sky's veiling luminance that
+// cancels the boost in the daytime contrast test. If the raster were physical, K
+// would tend to ~1; issue #338 tracks giving stars real radiometry + an exposure
+// model, after which this factor (and the raster boost) can be removed.
+//
+// K is NOT a day/night flag: at night and in space the sky in-scatter is ~0, so
+// K*lk is ~0 and vis is 1 for ANY K -- ground-night and orbit renders are
+// bit-identical across K (verified K = 1..20). K only sets how hard a LIT sky
+// washes stars out. K = 8 is a measured, conservative midpoint: K = 4 still
+// leaks a daytime dot at a low sun (+5 deg), K = 16 delays bright stars emerging
+// through twilight; 8 buries Sirius at noon (brightest daytime star +60 -> +0
+// sensor levels) while letting stars return by nautical/astronomical twilight as
+// the in-scatter falls. See starsRadianceRaw() for the surrounding rationale.
+// The max() below is a 0/0 NaN guard: it covers the ls = lk = 0 case, which the
+// s <= 0 early-out does NOT exclude (a star with s > 0 whose extinction T -> 0
+// against a dark sky gives ls -> 0, lk = 0). It is a divide guard, not a tuning
+// constant.
 static const float kStarVeilK = 8.0;
 float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
     float3 s = starsRadianceRaw(ro, rd);
