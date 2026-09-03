@@ -502,12 +502,44 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int   ms_oct  = clamp(int(raymarch_params.z + 0.5), 0, 4);
     float vol_int = max(raymarch_params.w, 0.0);
     int   light_steps = clamp(int(raymarch_quality.z + 0.5), 1, 16);
-    int   N = clamp(int(raymarch_quality.w + 0.5), 8, 128);
-    float dt = (t_out - t_in) / float(N);
+
+    // --- Continuous-step march (fly-through pop fix) --------------------
+    // The step length is derived from the cloud FIELD, not from the ray's
+    // span (t_out - t_in). The old `dt = (t_out - t_in) / N` tied the step
+    // to the span, which changes with camera altitude and view angle: a
+    // near-horizon shell chord runs 20-60 km, so a fixed N gave a 1-3 km
+    // step -- far coarser than the ~1/freq (hundreds of m) cloud features.
+    // Point-sampling that field at a step that SWINGS with altitude made
+    // the integrated in-scatter jump as the camera moved ("clouds change
+    // abruptly" flying through the deck). Pinning the near-field step to
+    // the field scale makes the sampling stationary in altitude, and the
+    // step grows with distance (solid-angle LOD: a cloud feature past a
+    // few km subtends less than one step of angle) so the march still
+    // reaches the horizon deck within a bounded sample budget -- the same
+    // geometric-growth idea lightMarch() already uses toward the sun.
+    //
+    // dt0: near-field step. Resolve the finer of the base noise wavelength
+    //      (1/freq) and the layer thickness; a fraction ~1/14 of the
+    //      wavelength tracks the effective edge frequency the coverage
+    //      threshold introduces on top of the base octave. Bounded so a
+    //      degenerate freq/thickness can't drive it to 0 or to the whole
+    //      layer. The user sample-count knob (raymarch_quality.w) scales
+    //      it: more samples -> finer near step (higher quality), fewer ->
+    //      coarser, span-independent either way.
+    float cl_wavelength = 1.0 / max(clouds_p2.z, 1e-6);
+    float cl_thickness  = max(top_y - base_y, 1.0);
+    float cl_quality    = clamp(raymarch_quality.w, 8.0, 128.0) * (1.0 / 32.0);
+    float dt0 = clamp(min(cl_wavelength, cl_thickness) * (0.07 / cl_quality),
+                      8.0, 160.0);
+    // Per-step growth. 1.04 reaches a ~60-80 km horizon chord in ~110-140
+    // steps from a dt0 of tens of metres, well under the 256 loop cap.
+    const float cl_growth = 1.04;
+    float dt = dt0;
     float t  = t_in;
-    // Jitter the first sample by [0, dt) so adjacent pixels' samples
-    // are decorrelated -- prevents grid aliasing on the cloud field.
-    float jit = randf(pix_seed) * dt;
+    // Jitter the first sample within its (growing) cell in [0,1); scaled by
+    // the local step below. Decorrelates adjacent pixels without biasing
+    // the stratification.
+    float jit = randf(pix_seed);
 
     // Planetary P3 (#257): the body whose air this cloud layer sits in.
     // Only the Rayleigh scale height is consumed here, but taking it from
@@ -527,11 +559,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float trans_cam = 1.0;
     float3 in_scatter = float3(0.0);
 
-    // Main march.
-    [loop] for (int i = 0; i < 128; ++i) {
-        if (i >= N) break;
-        float t_mid = t + 0.5 * dt + jit;
-        if (t_mid > t_out) break;
+    // Main march. Front-to-back with a geometrically growing step; the
+    // 256 cap is a safety bound, the march normally ends at the layer exit
+    // (t >= t_out) or when the camera ray goes opaque (trans_cam early-out).
+    [loop] for (int i = 0; i < 256; ++i) {
+        if (t >= t_out) break;
+        // Segment length integrated by this sample (clamped so the last
+        // step never overshoots the layer exit -- keeps the optical-depth
+        // sum span-exact regardless of where growth lands the final step).
+        float seg   = min(dt, t_out - t);
+        float t_mid = t + jit * seg;
         float3 sp = ro + rd * t_mid;
         float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 6,
                                       planet_center_radius)
@@ -578,29 +615,34 @@ void main(uint3 tid : SV_DispatchThreadID) {
             float boost  = (sun_am > 0.0) ? exp(0.30 * sun_am * h_norm) : 1.0;
             float3 sun_at = sun_rad * boost;
             // Powder term: dark-bottom approximation per Schneider 2015.
-            float powder = powderTerm(dens, dt);
+            float powder = powderTerm(dens, seg);
             // Mix the powder term in at 40% strength so cloud cores
             // don't go pitch black under self-shadow while the dark-
             // bottom rim still reads. Same coefficient Decima uses.
             float powder_mix = lerp(1.0, powder, 0.4);
             // Scattering coefficient -- in-scatter per unit length
             // from each light source weighted by phase. step_w gives
-            // the discrete-march weight: dens * dt * T_cam, mirroring
+            // the discrete-march weight: dens * seg * T_cam, mirroring
             // the inline cloud march's accumulation rule.
-            float step_w = dens * dt * trans_cam;
+            float step_w = dens * seg * trans_cam;
             float3 contrib = float3(0.0);
             contrib += sun_at   * ms_sun  * powder_mix;
             contrib += moon_rad * ms_moon * powder_mix;
             contrib += ambient;     // omnidirectional fill
             in_scatter += contrib * step_w;
             // Advance camera-ray transmittance.
-            trans_cam *= exp(-dens * dt);
+            trans_cam *= exp(-dens * seg);
             // Early exit: when the camera-ray is essentially opaque
             // any further samples can't change the visible alpha or
             // colour. Big speedup on the inside of thick cumulus.
             if (trans_cam < 0.003) break;
         }
+        // Advance the near edge by the (unclamped) step and grow it: the
+        // step schedule is a function of distance-from-entry only, so it
+        // is identical at every camera altitude -- the property that stops
+        // the deck popping as the camera flies through it.
         t += dt;
+        dt *= cl_growth;
     }
     // Apply the final volumetric-intensity scale (r_volumetric_intensity),
     // matching the inline path-traced march's `radiance += v_color * vol_int`

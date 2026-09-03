@@ -10295,6 +10295,32 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // exactly (see the Mie/Rayleigh march above for the
                     // half-cell-bias rationale).
                     float jitc = randf(seed);
+                    // --- Continuous-step cloud march (fly-through pop fix) ---
+                    // For CLOUDS the step is derived from the field scale and
+                    // grows geometrically with distance-from-entry, so it does
+                    // NOT swing with the ray's span as the camera changes
+                    // altitude. The old uniform `dtc = span/Nc` gave a 1-3 km
+                    // step on the 20-60 km near-horizon shell chord -- far
+                    // coarser than the ~1/freq cloud features -- and the point-
+                    // sampled in-scatter then jumped as the span moved with
+                    // altitude (the deck "changing abruptly" flying through it).
+                    // The long rationale lives in CloudsRaymarch.slang, whose
+                    // pre-pass uses the identical schedule so the two
+                    // r_clouds_mode paths agree. SMOKE (ground plumes, short
+                    // spans, no span-driven pop) keeps the uniform stratified
+                    // march bit-for-bit, so growth is gated to the pure-cloud
+                    // case and every smoke golden is unchanged.
+                    bool  cloud_growth  = (clouds_p1.w > 0.0) && !smoke_active;
+                    float cl_wavelength = 1.0 / max(clouds_p2.z, 1e-6);
+                    float cl_thickness  = max(top_y - base_y, 1.0);
+                    // Sample-count knob (r_volumetric_samples) scales the near
+                    // step: more samples -> finer, fewer -> coarser, always
+                    // span-independent. 24 is the neutral reference (planet
+                    // fixtures' value).
+                    float cl_quality = clamp(float(N), 4.0, 64.0) * (1.0 / 24.0);
+                    float cl_dt0 = clamp(min(cl_wavelength, cl_thickness)
+                                          * (0.07 / cl_quality), 8.0, 160.0);
+                    const float cl_growth = 1.04;
                     float trans_eye_c = 1.0;
                     float3 v_color_c  = float3(0.0);
                     // Phase 4 cvar pull. vol_density_scale clamps to a
@@ -10354,9 +10380,32 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             sky_ambient = float3(0.55, 0.70, 1.00) * (0.04 * phb * mat);
                         }
                     }
-                    for (int vi = 0; vi < Nc; ++vi) {
-                        float t = t_in + (float(vi) + jitc) * dtc;
-                        if (t > t_out) break;
+                    // 256 is a safety cap; the cloud march normally ends at
+                    // the layer exit or the trans_eye_c early-out, the smoke
+                    // march at vi >= Nc (identical iteration count to before).
+                    [loop] for (int vi = 0; vi < 256; ++vi) {
+                        float t;
+                        float seg;   // segment length integrated by this sample
+                        if (cloud_growth) {
+                            // Closed-form geometric placement: near edge and
+                            // step after vi growth steps (computed from vi, not
+                            // accumulated, so the empty-cell `continue` below
+                            // cannot desync the schedule). seg is clamped to the
+                            // layer exit so the optical-depth sum stays span-
+                            // exact on the final partial step.
+                            float gp    = pow(cl_growth, float(vi));
+                            float cl_dt = cl_dt0 * gp;
+                            float cl_t  = t_in + cl_dt0 * (gp - 1.0)
+                                                 / (cl_growth - 1.0);
+                            if (cl_t >= t_out) break;
+                            seg = min(cl_dt, t_out - cl_t);
+                            t   = cl_t + jitc * seg;
+                        } else {
+                            if (vi >= Nc) break;
+                            t = t_in + (float(vi) + jitc) * dtc;
+                            if (t > t_out) break;
+                            seg = dtc;
+                        }
                         float3 sp = primary_ro + primary_rd * t;
                         // Phase 4: heterogeneous density (procedural fbm
                         // via cloud_density_at) multiplied by the user
@@ -10450,7 +10499,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // horizon ray was producing white halos).
                         float3 trans_atm = atmosphericTransmittance(
                             primary_ro, primary_rd, t);
-                        float  step_w = dens * dtc * trans_eye_c;
+                        float  step_w = dens * seg * trans_eye_c;
                         // --- Multi-scatter Wrenninge octaves ----------------
                         // Approximates the diffuse light that has bounced
                         // multiple times inside the cloud and now exits
@@ -10508,7 +10557,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                             float g_o2 = g_o * g_o;
                                             float ph_o = (1.0 - g_o2) / (4.0 * 3.14159265358979
                                                 * pow(max(1.0 + g_o2 - 2.0 * g_o * c_t_h, 1e-4), 1.5));
-                                            float step_w_o = dens * a_pow * dtc * trans_eye_c;
+                                            float step_w_o = dens * a_pow * seg * trans_eye_c;
                                             ms_acc += hl.color * t_s * ph_o * step_w_o;
                                             a_pow *= 0.5;
                                             b_pow *= 0.5;
@@ -10599,7 +10648,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         float g_o2 = g_o * g_o;
                                         float ph_o = (1.0 - g_o2) / (4.0 * 3.14159265358979
                                             * pow(max(1.0 + g_o2 - 2.0 * g_o * c_t_sun, 1e-4), 1.5));
-                                        float step_w_o = dens * a_pow * dtc * trans_eye_c;
+                                        float step_w_o = dens * a_pow * seg * trans_eye_c;
                                         ms_acc += sun_at * trans_sun * ph_o * step_w_o;
                                         a_pow *= 0.5;
                                         b_pow *= 0.5;
@@ -10652,7 +10701,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             // function).
                             v_color_c += clampIndirect(sky_ambient * step_w * trans_atm * light_tint);
                         }
-                        trans_eye_c *= exp(-dens * dtc);
+                        trans_eye_c *= exp(-dens * seg);
                         // Early termination (Beer-Lambert front-to-back): once the
                         // accumulated eye transmittance is near zero the cloud is
                         // opaque along this ray, so every remaining march sample
