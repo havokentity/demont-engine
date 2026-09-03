@@ -7833,7 +7833,65 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // RGBA16F write per pixel per frame on non-AOV
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
-            albedo_tex[tid] = float4(hit_albedo, 0.0);
+            // MetalFX demodulation guard.
+            //
+            // MTLFXTemporalDenoisedScaler divides the input colour by this
+            // diffuse-albedo guide internally, reconstructs the demodulated
+            // "lighting", then re-multiplies. That is only valid where the
+            // radiance IS diffuse-albedo-modulated. On a planet it often is
+            // not: a distant water or dark-terrain pixel near the horizon
+            // carries a near-black, spectrally-skewed surface albedo (deep
+            // water ~0.02-0.06) while its visible radiance is dominated by
+            // NON-diffuse terms -- the Cox-Munk sun-glint and, above all,
+            // the additive aerial-perspective in-scatter, neither of which
+            // scales with the surface albedo. Dividing a bright haze colour
+            // (~40-80 in these units) by a ~0.02 albedo yields a demod
+            // signal of thousands, skewed by the albedo's own per-channel
+            // ratio, and MetalFX's sharpening reconstruction overshoots it
+            // into the bright magenta/green "aurora" band the user sees
+            // along the horizon over distant water and ridges. Measured on
+            // the raw MetalFX output: R and B pinned at ~2048, G left at
+            // ~20 -- vivid magenta from an accum pixel that was ~(77,50,28).
+            //
+            // Floor the guide per channel to an achromatic minimum. This
+            // does two things at once. (1) It removes the HUE SKEW: the
+            // albedos that trigger the artefact are all darker than the
+            // floor in every channel, so they clamp to the same grey value
+            // and the demod divisor stops carrying the albedo's per-channel
+            // ratio -- any residual MetalFX overshoot then stays neutral
+            // instead of magenta. (2) It BOUNDS THE MAGNITUDE: colour / guide
+            // can no longer exceed colour / floor, keeping the demodulated
+            // signal inside the range MetalFX already reconstructs cleanly
+            // elsewhere in the same frame (the physical sky reaches ~90 in
+            // these units and denoises without artefact). The transform is
+            // LOSSLESS for the final colour -- MetalFX divides and then
+            // re-multiplies by the SAME guide -- so no highlight is dimmed
+            // and no energy is added; only the intermediate signal MetalFX
+            // reconstructs is made well-conditioned.
+            //
+            // The floor is 0.3. A surface darker than that carries almost no
+            // diffuse texture detail for the demodulation to protect, so
+            // clamping its guide is pure robustness with no perceptible loss
+            // -- while a brighter, genuinely textured surface keeps its true
+            // albedo guide and the full demod benefit. Measured: 0.3 is the
+            // point at which the blow-up count reaches zero across a sun
+            // sweep from 2 deg (deep twilight, worst case) to 35 deg
+            // (daytime); lower floors leave a handful of edge fireflies,
+            // higher ones only flatten more demod for no further gain.
+            //
+            // Gated on write_specular_albedo_gbuffer, which the engine sets
+            // ONLY for the MetalFX-consuming denoiser kinds (issue #118), so
+            // the pure-SVGF path -- which demodulates in the engine's own
+            // shaders with its own kDemodEps floor and sky cutoff, and is
+            // the path the golden matrix pins -- writes the raw albedo
+            // unchanged. Surface hits only: sky/miss keeps its float3(0)
+            // sentinel so the scaler still treats the sky as un-demodulated.
+            const float kMetalFxDemodFloor = 0.3;
+            float3 guide = hit_albedo;
+            if (write_specular_albedo_gbuffer != 0u && h0.hit) {
+                guide = max(hit_albedo, float3(kMetalFxDemodFloor));
+            }
+            albedo_tex[tid] = float4(guide, 0.0);
         }
         // MetalFX specular-guidance G-buffers (issue #118). Three
         // textures fed to MTLFXTemporalDenoisedScaler so it can tell
