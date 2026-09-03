@@ -2262,6 +2262,54 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
+    # --- The FIRST MetalFX golden cell (issue #337) ------------------------
+    # The whole golden matrix was 25 `off` cells + 3 `svgf_atrous`, and ZERO
+    # under r_denoiser metalfx -- so nothing exercised MTLFXTemporalDenoised-
+    # Scaler or the MetalFX-only G-buffer writes (albedo demod guide, the
+    # #118 specular trio). The distant-water/ridge magenta the demod-floor
+    # fix in PathTrace.slang addresses lives ENTIRELY on this untested path;
+    # this cell makes it testable at all.
+    #
+    # SCENE. planet_aerial reuses the sibling `off` cell's camera (a 4 km
+    # flyover of dark, sub-0.3-albedo Himalayan rock under a 25 deg sun) --
+    # the same fixture the fix was characterised against -- so the demod
+    # floor `max(hit_albedo, 0.3)` is actually EXERCISED here (open ocean is
+    # not: the wave shell writes albedo 1.0, so a sea cell would be a no-op
+    # guard). It is NOT a magenta before/after: the overshoot is a
+    # moving-camera phenomenon and this harness renders a static camera, so
+    # no static fixture found in this rework reproduces the colour blow-up
+    # (the reviewer's finding too). What this cell pins is the FIXED output
+    # plus the fix's PRESENCE, via a real ablation.
+    #
+    # DETERMINISM. MetalFX is bit-exact run-to-run here: two 64-frame renders
+    # are MD5-identical (imgdiff 0.0000/0/0), so the temporal scaler
+    # converges to a stable frame and a golden is well-defined. FRAMES 64
+    # (not the planet block's 32) gives the temporal history enough warm-up
+    # to settle; measured at 64.
+    #
+    # TOLERANCES, sized against the fix-removal ablation (guide floor 0.0 =
+    # raw albedo, i.e. the bug this cell guards), measured on the M4 Max with
+    # imgdiff, noise floor exactly zero:
+    #     floor 0.3 (this golden) vs floor 0.0   mean_L2 1.68  rms 6.03
+    #                                            bad 5.73% (>8)  2.58% (>16)
+    #   MEAN_DELTA 0.5 -> 3.4x below the ablation's 1.68, infinitely above
+    #                     the zero run-to-run floor.
+    #   FAIL_PERCENT 1 -> 2.6x below the ablation's 2.58% bad-at-16.
+    #   MAX_DELTA 16   -> the planet-matrix default; kept (not tightened to
+    #                     the 0.0000 repeat) for another Apple-GPU
+    #                     generation's reconstruction drift, since MetalFX
+    #                     output may vary more across GPUs than the tracer's
+    #                     fma ordering. LOCAL guard only -- CI runs the
+    #                     software lane (#328), and needs macOS 26 for
+    #                     MTLFXTemporalDenoisedScaler; on an older Mac the
+    #                     engine reverts metalfx to off and this cell would
+    #                     diff against the off image. Widen or re-measure if
+    #                     it flakes across Apple GPU generations, or if the
+    #                     camera / exposure / frame count / the floor value
+    #                     moves.
+    pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER metalfx
+                       FRAMES 64 MAX_DELTA 16 MEAN_DELTA 0.5 FAIL_PERCENT 1)
+    # --- end first MetalFX golden cell -------------------------------------
     pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- #307: the cell where the ROCK RAMP is the variable under test -----
