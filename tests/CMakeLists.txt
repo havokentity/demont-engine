@@ -414,55 +414,73 @@ target_compile_definitions(pt_sky_units PRIVATE
 # std::isfinite -- under __FINITE_MATH_ONLY__ the latter folds to `true`
 # and an assertion goes quietly vacuous, which is exactly how PR #273
 # shipped a check that could not fail.
-pt_add_test(pt_planet_terrain
-    pt_planet_terrain_test.cpp
-    LINK_TARGETS pt_renderer)
+# CORE vs EXHAUSTIVE. One binary, built once, registered with ctest TWICE by
+# doctest test suite (the split is visible in `ctest -N`, not hidden behind a
+# runtime env var). The file header documents which cases carry
+# `* doctest::test_suite("exhaustive")` and why.
+#
+#   * pt_planet_terrain -- everything OUTSIDE the "exhaustive" suite: every
+#     acceptance-criterion claim (watertightness at representative levels,
+#     async==sync bake determinism, the LOD sub-pixel + hysteresis numbers, the
+#     #304 level-consistency, the finiteBits guard) plus the fast unit tests. No
+#     label, so it is in the default per-PR set (build.yml's `-LE golden`).
+#
+#   * pt_planet_terrain_exhaustive -- ONLY the "exhaustive" suite: the nine
+#     cases that drive the residency selector to full convergence, baking
+#     thousands of chunks apiece (~90% of the old wall time). LABELS "nightly"
+#     so the per-PR run excludes it (build.yml uses `-LE "golden|nightly"`) and
+#     the scheduled Nightly workflow selects it (`ctest -L nightly`). It is
+#     COVERAGE, not new claims -- every number it exercises is also asserted by
+#     a fast core case -- so keeping it off the PR path weakens no PR gate.
+#
+# WHY SPLIT, not raise the budget or trim the sweep. The combined test went
+# 180 -> 600 s once already (#322 -O2-in-Debug for the field TUs; #307
+# memoisation), then #316's per-vertex reference slope and #331's hillslope
+# saturation ate that headroom back and tipped the shared Windows Debug lane
+# over its 600 s budget, blocking unrelated PRs. Raising the budget a second
+# time hides the trend; TRIMMING the sweep would lose coverage (and a
+# Debug-only cut would mean the exhaustive half never runs in CI -- a labelled
+# test nobody executes). Splitting keeps the WHOLE sweep running in CI, just
+# nightly rather than per-PR, and turns the PR gate into a fast correctness
+# core. If the core itself ever needs to get faster: cut redundancy, not cases.
+#
+# -ffast-math in Release exactly as before -- the split changed no compile
+# flags, so the goldens and the intra-binary determinism/watertightness
+# equalities are unaffected.
+add_executable(pt_planet_terrain pt_planet_terrain_test.cpp)
+target_link_libraries(pt_planet_terrain PRIVATE doctest::doctest pt_renderer)
+if(COMMAND pt_target_warnings)
+    pt_target_warnings(pt_planet_terrain)
+endif()
 if(NOT MSVC)
     target_compile_options(pt_planet_terrain PRIVATE $<$<CONFIG:Release>:-ffast-math>)
 else()
     target_compile_options(pt_planet_terrain PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
-# The chunk-bake cases walk a level-19 chunk's full subdivision hierarchy,
-# which is ~22 000 field evaluations per chunk; the default 60 s backstop is
-# tight for that on a loaded machine.
-#
-# TIMEOUT 600, measured rather than guessed, and now carrying deliberate
-# slack. History: the 700 306-assertion suite took 157.9 s at -O0 on an M4
-# Max, and 600 s (~3.8x) was meant to leave room for a ~2x-slower runner.
-# The shared macos-26 and windows-latest runners turned out to be ~3.7x
-# slower than that M4 Max, so at -O0 the test crept to ~585 s -- inside the
-# budget by a hair, and every planetary change tipped a lane over 600.
-#
-# The budget was NOT raised (it went 180 -> 600 once already; raising it on
-# the second occurrence of the same signal hides the trend) and the sweep
-# was NOT trimmed (CI builds only Debug, so a Debug-only cut means the
-# exhaustive half never runs in CI -- a labelled test nobody executes, the
-# failure this file warns about two comments up). Two independent fixes
-# bought the headroom back instead, and they compound:
-#
-#   * BUILD (#322): the compute-bound field TUs -- CubedSphere,
-#     ElevationField, TerrainChunk -- are compiled at -O2 even in Debug (see
-#     src/renderer/CMakeLists.txt). -O2 WITHOUT -ffast-math is IEEE
-#     operation-by-operation exact, so the goldens do not move and the
-#     intra-binary sync-vs-async and watertightness assertions hold by
-#     construction. On an M4 Max this took the whole test from ~308 s to
-#     ~20 s; on the Windows Debug lane it went from a >600 s timeout to
-#     389 s (MSVC keeps checked-iterator STL in the TUs -O2 does not cover,
-#     so the multiple is smaller than clang's).
-#
-#   * SOURCE (#307): the reference-slope bake this feature added ran per
-#     chunk vertex, and the residency cases bake thousands of chunks, so the
-#     per-bake regression was multiplied by the sweep -- +81 s (+26%) as
-#     first written, every one of the nine slowest cases up 22-31% (the
-#     signature of "every bake got dearer", not a new case or a hang).
-#     Memoised (see ReferenceSlope01 / RockFractionFromRmsSlope, bit-exact
-#     and pinned by the goldens) it is +18 s; per level-13 bake, Release, the
-#     +41% became +11%. Worth doing on its own account, not just for CI: the
-#     same per-bake cost sets how long a streaming hole persists on screen.
-#
-# A slow honest test stayed honest and got fast. If it ever needs to get
-# faster again: cut redundancy, not cases.
-set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 600)
+
+# CORE (per-PR): exclude the "exhaustive" suite. TIMEOUT 180 -- measured ~13 s
+# on an M4 Max (-O2 Debug) and comfortably under a minute on the several-times-
+# slower shared runner, so unlike the combined test this never approaches its
+# budget. It still asserts determinism, watertightness, the LOD/hysteresis
+# numbers and the #304 level-consistency; a field bug fails it fast.
+add_test(
+    NAME    pt_planet_terrain
+    COMMAND pt_planet_terrain --test-suite-exclude=exhaustive
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 180)
+
+# EXHAUSTIVE (nightly): the same binary, opposite filter. The "nightly" label
+# is what build.yml's per-PR `-LE "golden|nightly"` excludes and the Nightly
+# workflow's `-L nightly` step selects; "planetary" mirrors pt_planet_residency.
+# TIMEOUT 900 -- ~96 s on an M4 Max, several times that on the runner, but a
+# nightly job has the room and a generous backstop costs nothing there.
+add_test(
+    NAME    pt_planet_terrain_exhaustive
+    COMMAND pt_planet_terrain --test-suite=exhaustive
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(pt_planet_terrain_exhaustive PROPERTIES
+    TIMEOUT 900
+    LABELS  "nightly;planetary")
 
 # --- pt_planet_residency (paced terrain streaming) -------------------------
 # Chunk residency on the PACED streaming path.
