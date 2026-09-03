@@ -254,24 +254,16 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     // binding 35. Read only on a mesh hit when mesh_tex_indices has a
     // non-kPbrNoTexTile channel.
     35, // engine slot 17 -> shader binding 35 (mesh_uvs)
-    // Planetary P4 (#258). Binding 36 was the last free number below 37;
-    // 37 is GodRays' mask TEXTURE (bindings share one number space with
-    // images in set 0), so the other two continue at 38/39.
-    36, // engine slot 18 -> shader binding 36 (terrain_verts)
-    38, // engine slot 19 -> shader binding 38 (terrain_indices)
-    39, // engine slot 20 -> shader binding 39 (instance_desc)
     // #280: Hillaire 2020 multiple-scattering table, built on the CPU into
     // a storage buffer rather than by a compute pass (no new pipeline).
-    // 46 and not 40: OceanCascades.slang (#293) declares 40..45 and has no
-    // Vulkan pipeline yet, so those six are reserved for the layout entries
-    // it will need rather than free to take.
-    46, // engine slot 21 -> shader binding 46 (atmo_ms_lut)
-    // Land cover (#300): the surface albedo raster, an equirectangular
-    // RGBA8 grid packed one texel per uint. Slot 22 is the LAST entry this
-    // table has; a further buffer needs kSlotToBufBinding, VulkanDevice's
-    // bound_buf_[24], MetalDevice's bound_buf_[24] and SoftwareDevice's
-    // buffers[24] all resized together.
-    47, // engine slot 22 -> shader binding 47 (land_albedo)
+    // With the planetary terrain arenas removed (former slots 18/19/20) this
+    // is the first buffer past mesh_uvs. The vk::binding stays 46 -- the
+    // shader still declares it there and only the engine-slot index moved.
+    46, // engine slot 18 -> shader binding 46 (atmo_ms_lut)
+    0,  // engine slot 19 unused
+    0,  // engine slot 20 unused
+    0,  // engine slot 21 unused
+    0,  // engine slot 22 unused
     0,  // engine slot 23 unused
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.

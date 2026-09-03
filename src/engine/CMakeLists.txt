@@ -42,7 +42,6 @@ add_library(pt_engine STATIC
     Engine.cpp
     FrameCapture.cpp
     LensFlare.cpp
-    PlanetTerrain.cpp
 )
 
 target_include_directories(pt_engine PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -96,16 +95,6 @@ else()
     target_compile_definitions(pt_engine PRIVATE PT_LIGHT_TREE_ENABLED=0)
 endif()
 
-# PT_PLANET_ENABLED (#258, planetary P4): when OFF, Engine.cpp compiles
-# out the terrain quadtree, the streamer and the three terrain buffers,
-# and forces the runtime cvar r_planet_terrain to 0 with a single startup
-# [warn] if a scene asked for it. The shader half is gated by the
-# matching slangc -D in rhi_metal / rhi_vulkan.
-if(PT_PLANET_ENABLED)
-    target_compile_definitions(pt_engine PRIVATE PT_PLANET_ENABLED=1)
-else()
-    target_compile_definitions(pt_engine PRIVATE PT_PLANET_ENABLED=0)
-endif()
 # --- end Megakernel feature gates -----------------------------------------
 
 pt_set_compiler_options(pt_engine)

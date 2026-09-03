@@ -179,50 +179,9 @@ option(PT_LIGHT_TREE
     "Compile hierarchical light tree (#129) into the PathTrace megakernel. OFF strips the traversal helpers from SPIR-V (~9 KB) but does not measurably recover the +7.67 ms regression PR #154 introduced (see follow-up); ON = O(log N) importance-weighted light pick (Conty Estevez & Kulla 2018)."
     ON)
 
-# PT_PLANET_ENABLED (issue #258, planetary P4): the streamed cubed-sphere
-# terrain. When ON, PathTrace.slang compiles the per-instance descriptor
-# read at the mesh hit -- CommittedInstanceID() indexing an SSBO for the
-# material, the UV density and the baked slope variance -- plus the three
-# terrain buffers, and the engine compiles the quadtree / residency
-# selector / streaming pipeline.
-#
-# The gate exists for the reason the three above it exist, not as a
-# convention: this is a megakernel, and a branch's mere PRESENCE costs
-# every scene. It also gives a clean bit-identity check -- with the gate
-# OFF the mesh hit block is character-for-character the pre-#258 one, so
-# every existing golden is provably untouched by the shader half of this
-# phase, independently of the runtime cvar.
-#
-# Default ON, matching PT_WATER_ENABLED and PT_LIGHT_TREE's policy of
-# preserving functionality. The terrain is separately gated at RUNTIME by
-# `r_planet_terrain` (default 0), so a build with this ON renders every
-# existing fixture exactly as before -- the descriptor read resolves to
-# entry 0, which the engine fills with the same MAT_METAL / MESH_ALBEDO /
-# 0.05 the shader used to hard-code.
-option(PT_PLANET_ENABLED
-    "Compile planetary terrain (#258) into the PathTrace megakernel: per-instance material descriptors, the terrain vertex/index arenas and the slope-variance roughness fold. OFF reverts the mesh hit block to its hard-coded pre-#258 material and compiles out the terrain streaming in the engine."
-    ON)
-
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
 include(cmake/EmbedResource.cmake)
-
-# --- Drop MSVC's /RTC1 from Debug ------------------------------------------
-# The compute-bound terrain-field TUs are compiled at /O2 even in Debug (see
-# src/renderer/CMakeLists.txt) so pt_planet_terrain stays inside its CI time
-# budget. MSVC's default Debug flags carry /RTC1 (stack + uninitialised-use
-# runtime checks), and /RTC1 is a HARD error combined with /O2 (D8016), not a
-# warning -- so it has to go for those files to compile. There is no per-file
-# way to strip a flag that arrives from CMAKE_CXX_FLAGS_DEBUG, so drop it
-# project-wide: the Linux clang ASan/UBSan lane already exercises the same
-# class of bug (uninitialised reads, stack corruption) far more thoroughly
-# than /RTC1, so on Windows it is redundant rather than load-bearing. Debug
-# still builds unoptimised everywhere else (the /Od in pt_set_compiler_options
-# is untouched); only /RTC1 leaves.
-if(MSVC)
-    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
-    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG}")
-endif()
 
 # --- Vulkan (native Windows/Linux only) ------------------------------------
 if(PT_ENABLE_VULKAN_BACKEND)

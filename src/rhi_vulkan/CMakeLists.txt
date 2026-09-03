@@ -108,16 +108,11 @@ if(PT_LIGHT_TREE)
 else()
     set(_pt_light_tree_def "-DPT_LIGHT_TREE_ENABLED=0")
 endif()
-if(PT_PLANET_ENABLED)
-    set(_pt_planet_def "-DPT_PLANET_ENABLED=1")
-else()
-    set(_pt_planet_def "-DPT_PLANET_ENABLED=0")
-endif()
 # --- end Megakernel feature gates -----------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
+    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 # Second PathTrace SPIR-V variant without RayQuery, for Vulkan drivers that
 # don't expose VK_KHR_ray_query.
@@ -129,7 +124,7 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
+    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY ${_pt_water_def} ${_pt_light_tree_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
@@ -175,22 +170,6 @@ pt_compile_slang(
     MODULE_DEPS PathTraceCloud PathTraceMath)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsComposite.slang
-    STAGE compute ENTRY main TARGETS spirv)
-# Planetary P5 (#259) / #133 Phase 2 -- the ocean cascade FFT pre-pass.
-# COMPILED HERE BUT NOT DISPATCHED. The SPIR-V is built (and validated by
-# spirv-val) so the kernel cannot rot into something Vulkan could never
-# consume, but VulkanDevice builds no pipeline from it: the shared
-# descriptor-set layout stops at binding 39 and this kernel declares
-# 40..45, and a shader declaring a binding the layout lacks is a hard
-# vkCreateComputePipelines failure even under PARTIALLY_BOUND. Adding the
-# six entries is the whole of what a Vulkan port needs, and it is
-# deliberately not done blind: no Vulkan device has executed any of this
-# planetary arc (#290), and the ocean storage images are already
-# non-square (grid x 3*grid, plus a metadata row) which VulkanDevice has
-# never seen. Until then the Vulkan path takes the CPU cascade solver,
-# which is what it has always run.
-pt_compile_slang(
-    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/OceanCascades.slang
     STAGE compute ENTRY main TARGETS spirv)
 # SVGF/NRD denoiser kernels. Each is its own SPIR-V blob; the Vulkan
 # backend's VulkanNrdDenoiser builds a dedicated VkPipelineLayout +

@@ -39,10 +39,7 @@
 #include "../physics/PhysicsSystem.h"
 #include "../physics/SmokeSPH.h"
 #include "../physics/OceanFFT.h"   // Wave 8 (#25) FFT ocean surface
-// #259 / #133 Phase 2: the push layout + five-pass sequence for
-// shaders/OceanCascades.slang, shared with tests/pt_ocean_gpu_test.cpp.
-#include "../physics/OceanCascadeDispatch.h"
-#include "../physics/WaterOptics.h"  // Planetary P7 (#261) seawater optics
+#include "../physics/WaterOptics.h"  // seawater optics for MAT_WATER shading
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -585,24 +582,6 @@ namespace cvar {
             "only -- the Software backend's hand-written CPU tracer ignores "
             "the ocean textures and renders the flat analytic water plane.",
             CVAR_ARCHIVE);
-    // --- #259 / #133 Phase 2: the cascades on the GPU ---------------------
-    PT_CVAR(r_ocean_gpu, "1",
-            "Solve the PLANETARY ocean cascades (r_planet_ocean 1) in the "
-            "shaders/OceanCascades.slang compute pre-pass instead of on the "
-            "CPU (#259, #133 Phase 2). 1 = GPU when the backend can host "
-            "the pipeline, 0 = the pt::ocean::OceanFFT host solver. The "
-            "host solver stays the reference implementation either way -- "
-            "it builds the seeded Phillips base spectrum the GPU pass "
-            "consumes, it is what tests/pt_ocean_fft_test.cpp pins, and it "
-            "is the automatic fallback on Software (no compute pipelines) "
-            "and Vulkan (the shared descriptor-set layout does not declare "
-            "this kernel's bindings yet). Measured on an M4 Max at "
-            "r_ocean_grid_size 256, the CPU path costs 15.6 ms/frame of "
-            "single-threaded solve + 6 MB of upload; see "
-            "tests/pt_ocean_gpu_test.cpp for the CPU-vs-GPU agreement "
-            "bound. Has NO effect on the single-tile MAT_WATER plane ocean "
-            "(r_planet_ocean 0), which is CPU-solved either way.",
-            CVAR_ARCHIVE);
     PT_CVAR(r_ocean_wind_speed, "12.0",
             "Ocean wind speed in m/s (#25). Drives the Phillips "
             "characteristic length L = windSpeed^2 / g (g = 9.81), hence "
@@ -693,28 +672,6 @@ namespace cvar {
             "missed thin crests at grazing angles, at GPU cost.",
             CVAR_ARCHIVE);
     // --- end Wave 8 ocean ----------------------------------------------------
-    // --- Planetary P5 (#259): the planetary ocean ----------------------------
-    PT_CVAR(r_planet_ocean, "0",
-            "Planetary ocean (#259). 1 = a MAT_WATER shell at sea level on "
-            "the SAME body r_planet_radius / r_planet_ground already define, "
-            "so land is above it and seabed below it by construction rather "
-            "than by agreement between two numbers. Requires "
-            "r_planet_spherical_frame 1 (a planar frame has no centre to put "
-            "a shell around) and is ignored without it. 0 leaves every "
-            "MAT_WATER surface the infinite analytic plane it has always "
-            "been, bit for bit.\n"
-            "  Terrain above sea level occludes the shell with no special "
-            "case at all: traceScene keeps the closest hit.\n"
-            "  WITH r_ocean 0 the shell is a smooth Fresnel sphere whose "
-            "roughness is Cox & Munk's measured slope variance for "
-            "r_ocean_wind_speed -- which is exactly what a wave field seen "
-            "from far enough away IS, and is therefore the A/B control the "
-            "geometry-to-BRDF handover is measured against. WITH r_ocean 1 "
-            "three band-limited FFT cascades carry the slope the ray cone "
-            "still resolves and the roughness carries the rest, summing to "
-            "the same constant at every distance.",
-            CVAR_ARCHIVE);
-    // --- end Planetary P5 ----------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
@@ -2017,320 +1974,13 @@ namespace cvar {
             "is carried across the unit change by one documented factor "
             "(kPtLegacySkyScale) so the comparison is still like for "
             "like.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_ground,         "0",
-            "Render the planet itself as an analytic body (planetary P3, "
-            "issue #257). 0 = off, which is every scene authored before "
-            "this phase -- the ground is the flat infinite plane at y = 0. "
-            "1 = a sphere of radius r_planet_radius centred where the "
-            "atmosphere shell is centred, so a ground camera gets a "
-            "geometrically real curved horizon: the sky ends where the "
-            "body occludes it rather than where a painted gradient says "
-            "it does, and the cloud shell terminates against the same "
-            "horizon. Requires r_planet_spherical_frame 1, since a planar "
-            "frame has no planet centre to put a body at. Note the flat "
-            "ground plane, if the scene has one, sits ABOVE this body "
-            "everywhere except the tangent point and will win every hit; "
-            "author the scene without it to see the body. This is the "
-            "backstop the terrain track (#258) streams chunks in front "
-            "of -- it is deliberately a SPHERE of the IUGG mean radius, "
-            "not the WGS-84 ellipsoid: see the phase notes for why the "
-            "ellipsoid needs the polar-axis orientation that only terrain "
-            "introduces, and its own numerics work.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_ground_albedo,  "0.18",
-            "Lambertian albedo of the r_planet_ground body. 0.18 is the "
-            "standard mid-grey photographic reference and sits between "
-            "Earth's ocean (~0.06) and its land average (~0.25); the "
-            "planet's Bond albedo of 0.306 (NASA Earth Fact Sheet) is a "
-            "whole-disc figure including clouds, which this body does not "
-            "carry. Clamped to [0, 1]. A real surface map belongs to the "
-            "terrain track (#258), not here.", CVAR_ARCHIVE);
-
-    // --- BEGIN planetary P4 terrain cvars (#258) --------------------------
-    // Delimited so a concurrent edit to this contiguous PT_CVAR block lands
-    // outside the region rather than through it.
-    PT_CVAR(r_planet_terrain,        "0",
-            "Streamed cubed-sphere terrain (planetary P4, issue #258). 1 = "
-            "the planet becomes a real, walkable surface: a quadtree of "
-            "65x65 heightfield chunks on the WGS-84 ellipsoid, streamed "
-            "into the hardware ray query as TLAS instances, with real ETOPO "
-            "2022 topography and bathymetry as the base field and a "
-            "self-affine fractal continuation below the data floor. 0 = "
-            "off, and the engine renders exactly what it did before this "
-            "phase. Requires hardware ray tracing (the software backend has "
-            "no TLAS to stream into and would need a per-ray loop over a "
-            "thousand chunks); the engine logs once and stays off there. "
-            "Also implies r_planet_spherical_frame, since a planar frame "
-            "has no centre to put a planet at.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_site_lat,       "27.9881",
-            "Geodetic latitude in degrees of the scene's reference SITE -- "
-            "the point on the ellipsoid that sits at the engine's world "
-            "origin, with world +Y its local up. Anchoring the world frame "
-            "at a site rather than at the planet's centre is what preserves "
-            "every existing camera convention: cam_pitch 0 still looks "
-            "level and yaw 0 still looks north. Default 27.9881N / 86.9250E "
-            "is the summit of Everest -- the most recognisable relief on "
-            "Earth, and one that survives Earth-lite's ~20 km/texel because "
-            "the Himalayan front and the Tibetan plateau are a 2 000 km "
-            "feature. Changing this restarts the terrain streamer.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_site_lon,       "86.9250",
-            "Geodetic longitude in degrees of the scene's reference site. "
-            "See r_planet_site_lat.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_lod_error_px,   "0.5",
-            "tau -- the permitted terrain geometric error in PIXELS. A "
-            "chunk splits when its baked Ulrich (2002) delta e_L divided by "
-            "its distance exceeds tau * cone_spread, where cone_spread = "
-            "2*tan(fovY/2)/height is the exact expression PathTrace.slang "
-            "uses per pixel, evaluated once on the host and pushed. At the "
-            "0.5 default every LOD transition is provably SUB-PIXEL, which "
-            "is what deletes the need for geomorphing rather than paying "
-            "for it -- geomorphing in a ray tracer means rebuilding a BLAS "
-            "every frame through the morph. Raise for fewer chunks and "
-            "visible popping; lower for more chunks and no visual gain.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_lod_hysteresis, "1.4",
-            "Merge distance as a multiple of the split distance. Not "
-            "polish: a chunk oscillating across the threshold issues a BLAS "
-            "build AND a BLAS destroy every frame. At 1.4 a chunk that just "
-            "split has to recede 40% further before it merges again. 1.0 "
-            "disables hysteresis and is a good way to see why it exists.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_lod_min_level,  "0",
-            "Floor on terrain subdivision level. The LOD proof (cone_width "
-            "at a hit is >= cone_spread * |p - camera| for EVERY ray, by "
-            "the triangle inequality on the accumulated path length) has "
-            "one genuine violation: a convex lens or a concave mirror can "
-            "produce a footprint SMALLER than the camera distance implies. "
-            "The engine already commits that violation everywhere -- "
-            "cone_width carries no curvature term, so pbrConeTexLod "
-            "over-blurs through a magnifier today -- so terrain is no "
-            "worse, and this is the floor for scenes that care.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_lod_max_level,  "19",
-            "Detail ceiling. Level 19 chunks are 19.1 m across with 0.30 m "
-            "vertex spacing -- walking scale. The ceiling exists because a "
-            "level-0 chunk's 156 km vertex spacing reaches one pixel at "
-            "2.87e8 m, so ~20 levels span everything from underfoot to "
-            "further away than geometry means anything at all. Lower it to "
-            "cap memory and bake cost on a slower machine.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_chunk_budget,   "1024",
-            "Terrain LEAF cap: the size of the frontier the selector may "
-            "ask for. The ARENA is larger, and by an exact amount rather "
-            "than a margin -- residency is the whole cut (#319), and a "
-            "quadtree cut with L leaves has exactly (L - 6) / 3 interior "
-            "nodes, so the arena is L + (L - 6) / 3 slots: 1363 at the "
-            "default 1024. Those ancestors are kept resident and "
-            "UNPUBLISHED so that zooming out has something one level "
-            "coarser to draw instead of a hole while the coarse chunk "
-            "bakes; sizing the arena for them rather than lowering this cap "
-            "is what keeps the converged desired set -- and every planet "
-            "golden -- exactly where it was.\n"
-            "Each chunk is 4 225 vertices: 67.6 KB of shader-visible vertex "
-            "data plus its BLAS, so ~100-170 KB resident. At 1024 leaves "
-            "the arena is 1363 chunks, ~135-230 MB, unremarkable on unified "
-            "memory.\n"
-            "The cap is SOFT at the boundary: over budget "
-            "the selector raises tau by bisection until the balanced set "
-            "fits, which is the same rule everywhere and therefore stays "
-            "balanced -- merging the lowest-priority sibling groups instead "
-            "does NOT converge, because a merged parent violates the 2:1 "
-            "restriction and the re-balance splits it straight back. "
-            "Changing this restarts the terrain streamer.\n"
-            "ON THE CAP, the effective tau is a function of the measurement "
-            "frontier as well as of the camera: the bisection's trial sets "
-            "treat an unmeasured node as a leaf, so a trial run early in the "
-            "descent under-counts. Under the capture settle barrier (#284) "
-            "that frontier is itself deterministic -- rounds advance by "
-            "completed bake rounds, not by elapsed frames -- so the tau two "
-            "runs pick is the same tau, which is what a golden needs. It is "
-            "still not the tau a fully-informed bisection would pick, and "
-            "that remains worth closing if a fixture ever needs to sit on "
-            "the cap. No golden fixture currently does: "
-            "r_planet_chunk_budget 2048 against measured leaf sets of 645, "
-            "1 419 and 468 (the post-#304 figures; the 1 128 / 1 806 / "
-            "1 008 recorded here before were P4's), and EnforceBudget was "
-            "instrumented and observed never to run on any of the three. "
-            "pt_planet_residency's teleport case does sit on the cap, "
-            "deliberately -- it is the only way left to squeeze the arena "
-            "now that the arena carries the ancestor allowance, and it "
-            "asserts invariants rather than which set the selector picked.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_blas_budget_ms, "2.0",
-            "Per-frame wall-clock budget for terrain acceleration-structure "
-            "builds, in milliseconds. P0 (#254) made TLAS instance updates "
-            "drain-free, but it did NOT make BLAS creation non-blocking -- "
-            "Device::CreateBLAS still ends in waitUntilCompleted / "
-            "vkQueueWaitIdle by design, one stall per create, which is what "
-            "Device::AccelGpuStallCount documents. This budget is what "
-            "bounds that: a frame spends at most this long inside "
-            "CreateBLAS no matter how fast the LOD boundary swept. 0 "
-            "disables pacing (every needed chunk is built immediately), "
-            "which is right for a deterministic capture and wrong for an "
-            "interactive session.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_lod_freeze,     "0",
-            "1 = pin the terrain residency set exactly as it is, ignoring "
-            "the camera. Mandatory before any planet golden can exist: "
-            "chunk generation is asynchronous, so without this frame N "
-            "depends on wall clock and no golden would ever reproduce. "
-            "Mirrors the freeze_sims_for_capture gate the physics / ocean / "
-            "SPH subsystems already use. Pair it with the settle wait "
-            "(pt_planet_settle_rounds) so the freeze happens on a CONVERGED set "
-            "rather than on whatever had streamed in by then.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_workers,        "4",
-            "Chunk-bake worker threads. Generation is embarrassingly "
-            "parallel and entirely off the render thread; a level-19 chunk "
-            "costs ~22 000 elevation-field evaluations.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_dem,            "assets/planet/earth_lite.ptdem",
-            "Path to the elevation grid, relative to the asset root. The "
-            "engine ships TOOLING rather than the data: run "
-            "`python3 tools/fetch_planet_dem.py` to download ETOPO 2022 "
-            "from NOAA/NCEI (a US Government work, public domain, and the "
-            "only candidate that carries topography and bathymetry in one "
-            "grid) and bake the Earth-lite file. With no file present the "
-            "engine renders a PROCEDURAL body and says so once -- it is not "
-            "Earth, and the difference is the whole reason this project "
-            "ships the real Yale Bright Star Catalogue and the real "
-            "ArHosekSkyModel dataset instead of plausible substitutes. "
-            "Empty disables the DEM entirely.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_hurst,          "0.5",
-            "Hurst exponent of the fractal continuation ABOVE the hillslope "
-            "break. 0.5 is MEASURED, not chosen: continental topography has "
-            "a power spectrum with beta ~ 2, i.e. a surface fractal "
-            "dimension D ~ 2.5, and D = 3 - H (Turcotte, Fractals and Chaos "
-            "in Geology and Geophysics, 2nd ed. 1997, ch. 7). Raise toward "
-            "1 for a smoother body, lower toward 0 for a rougher one; both "
-            "are departures from Earth.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_hurst_fine,     "1.0",
-            "Hurst exponent BELOW the hillslope break, where diffusive "
-            "sediment transport smooths the surface faster than channel "
-            "incision roughens it. Perron, Kirchner & Dietrich 2008 (JGR "
-            "113:F04003) measure sub-break spectral slopes beta = 4.5-5.2, "
-            "i.e. H = 1.25-1.6, which would erase every sub-metre feature; "
-            "Shepard et al. 2001 (JGR Planets 106:32777) fit 60 natural "
-            "surfaces and find H near 0.5, so real ground is still rough "
-            "at sub-metre lags rather than locally planar. 1.0 is the "
-            "conservative value between them and "
-            "the marginal case: RMS slope becomes scale-invariant instead "
-            "of diverging. Clamped to be at least r_planet_hurst.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_hillslope_break, "106",
-            "Lag in metres at which topography stops being fluvially "
-            "dissected and starts being diffusively smoothed -- the scale "
-            "break the continuation crosses over at. MEASURED: Perron, "
-            "Kirchner & Dietrich 2008 (JGR 113:F04003) put the spectral "
-            "roll-off at 180 m wavelength at Gabilan Mesa and 250 m at the "
-            "South Fork Eel River; a spectral feature at wavelength L shows "
-            "up in a structure function at lag L/2, giving 90 m and 125 m, "
-            "whose geometric mean is 106 m. NOT relief-dependent: the "
-            "hillslope length is set by the diffusion/incision efficiency "
-            "ratio (Perron, Dietrich & Kirchner 2008, JGR 113:F04016), a "
-            "climate and lithology property. 0 removes the break and "
-            "restores the single unbroken power law, whose slope diverges "
-            "as the LOD refines -- the pre-#304 bug, kept only for A/B.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_detail_gain,    "1.0",
-            "Multiplier on the fractal continuation's amplitude. 1.0 is the "
-            "measured continuation from the DEM's own local relief. Exists "
-            "for A/B against the data floor, not for tuning the look.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_max_slope,      "1.0",
-            "Threshold-hillslope cap on the slope the fractal continuation "
-            "may add at any one level, as a tangent. A self-affine surface "
-            "with H < 1 is nowhere differentiable -- sigma(l)/l diverges as "
-            "l -> 0 -- so continuing it unbounded down to 0.30 m spacing "
-            "produces vertical walls and overhangs a heightfield cannot "
-            "even represent. Real terrain has a lower cutoff: hillslopes "
-            "steepen only to a landsliding threshold, measured at ~30 deg "
-            "modal slope in the actively uplifting northwest Himalaya "
-            "(Burbank et al. 1996, Nature 379:505), and granular material "
-            "stands at its angle of repose, ~34 deg for dry sand "
-            "(Al-Hashemi & Al-Amoudi 2018, Powder Technology 330:397). The "
-            "1.0 default is tan(45 deg): it admits real bedrock cliffs and "
-            "refuses the mathematically unbounded ones.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_procedural_relief, "900",
-            "RMS relief in metres at the notional data floor when NO DEM is "
-            "loaded. Unlike every other number in this block it is not a "
-            "measurement -- with no data there is nothing to measure -- so "
-            "it is a stated assumption: ~900 m is Earth's continental RMS "
-            "relief at a 20 km lag. Ignored entirely once a DEM is present, "
-            "where the continuation reads the real local relief per point.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_snowline,       "4900",
-            "Snowline altitude in metres AT THE EQUATOR -- the anchor for "
-            "the latitude model, not the snowline itself. 4 900 m is the "
-            "measured tropical equilibrium-line altitude (Kaser & Osmaston, "
-            "Tropical Glaciers, CUP 2002). Land cover (#300) replaced the "
-            "old `anchor * cos(site latitude)` with a freezing-level model: "
-            "the zonal-mean surface temperature (North, Cahalan & Coakley "
-            "1981, Rev. Geophys. 19:91) plus half the annual range, divided "
-            "by the 6.5 K/km environmental lapse rate (ICAO / ISO 2533). "
-            "That halves the mean error against published equilibrium-line "
-            "altitudes at 45/60/80 degrees, and -- the part that matters "
-            "for a planet -- it is evaluated at the SHADED POINT rather "
-            "than at the site, so a globe seen from orbit no longer has one "
-            "snowline everywhere. See src/renderer/Planet/SurfaceAlbedo.h "
-            "for the derivation and the validation table. It selects an "
-            "albedo and never touches geometry.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_albedo_map,     "assets/planet/earth_lite.ptalb",
-            "Path to the surface albedo raster (#300). Empty, or a file "
-            "that will not load, drops the terrain to the PROCEDURAL "
-            "classification and says so once -- which is a body with rock "
-            "and regolith, not Earth. Bake one with "
-            "tools/fetch_planet_albedo.py; the source, its licence and what "
-            "it is NOT are recorded in assets/planet/PROVENANCE.md. "
-            "Deliberately a path and not a bool, because pointing it at a "
-            "different body is how a non-Earth planet gets real land cover "
-            "if a dataset for one ever exists.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_land_albedo,    "1",
-            "Blend from the procedural biome classification (0) to the "
-            "measured albedo raster (1). This is the A/B for #300, not a "
-            "look knob: at 0 the terrain shades exactly as it does with no "
-            "raster loaded, which is what makes the ablation clean. It does "
-            "NOT disable the slope-driven rock exposure or the "
-            "latitude-derived snowline -- those are DEM-driven and apply to "
-            "both paths, because a raster at any resolution cannot know "
-            "that a 40-degree face sheds its soil.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_planet_stand_eye,      "-1",
-            "Eye height in metres above the TERRAIN at which to place the "
-            "camera on the first frame the streamer is live. Negative "
-            "disables it and the camera stays wherever cam_pos put it.\n"
-            "This exists because `cam_pos 0 1.7 0` stops meaning `eye "
-            "height` the moment the ground is a height field: the engine's "
-            "y = 0 is the ellipsoid at the reference site, and the terrain "
-            "there is at Everest's 8 849 m with the real ETOPO grid and at "
-            "whatever the fractal produced without one. A literal 1.7 "
-            "leaves the camera either buried or a kilometre in the air. "
-            "The `earth` scene seed sets this to 1.7 when it also placed "
-            "the camera; a fixture that positions its own camera sets it "
-            "itself or leaves it off. `planet_stand` does the same thing "
-            "on demand from the console.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_cam_speed_scale, "1",
-            "1 = scale cam_speed with altitude above the terrain, so one "
-            "camera control works from a 1.7 m eye height to a 400 km "
-            "orbit. cam_speed's 3 m/s default is a walking pace and you "
-            "cannot reach orbit at a walking pace. The effective speed "
-            "becomes max(cam_speed, altitude / 4) m/s -- a quarter of the "
-            "altitude per second, which holds the horizon's angular rate "
-            "roughly constant at every scale. 0 = the literal cam_speed "
-            "everywhere. Only active while r_planet_terrain is on.",
-            CVAR_ARCHIVE);
-    PT_CVAR(r_scene_default,         "earth",
+    PT_CVAR(r_scene_default,         "spheres_csg",
             "Which scene Init() seeds when a fixture does not supply its "
-            "own. `earth` = the planet: real Earth with streamed terrain, "
-            "the spherical frame and the analytic backstop body, camera at "
-            "eye height on the reference site. `spheres_csg` = the engine's "
-            "historical default, three analytic spheres on a grey plane "
-            "plus the drilled-cube CSG mesh. `none` seeds neither and is "
-            "equivalent to setting both pt_smoke_skip_prim_seed and "
-            "pt_smoke_skip_csg_seed. Every golden fixture that depended on "
-            "the historical default now states `r_scene_default "
-            "spheres_csg` explicitly, so flipping this default moved no "
-            "pixels.", CVAR_ARCHIVE);
-    // --- END planetary P4 terrain cvars (#258) ----------------------------
+            "own. `spheres_csg` = the engine's default, three analytic "
+            "spheres on a grey plane plus the drilled-cube CSG mesh. "
+            "`none` seeds neither and is equivalent to setting both "
+            "pt_smoke_skip_prim_seed and pt_smoke_skip_csg_seed.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
@@ -2892,116 +2542,25 @@ bool Engine::Init() {
     // can opt out via pt_smoke_skip_csg_seed so the SDF acceptance
     // scene renders without the gold drilled-cube in frame.
     csg_scene_ = std::make_unique<pt::csg::CsgScene>();
-    // --- Planetary P4 (#258): which scene Init seeds ---------------------
-    //
-    // The default became `earth`. That is a deliberate switch, and it is
-    // made in a way that moves no pixels: every golden fixture that
-    // depended on the historical three-spheres-plus-drilled-cube seed now
-    // states `r_scene_default spheres_csg` in its own .cfg, so its render
-    // is character-for-character what it was.
-    //
-    // The `earth` seed only writes a cvar the scene left at its DEFAULT.
-    // The fixture exec runs before this point (Engine::Init applies
-    // pt_smoke_exec well above), so a fixture that sets, say,
-    // r_planet_lod_max_level keeps its value and only gets the seeds it
-    // did not express an opinion about. `value == default_value` is the
-    // "the scene did not touch this" test -- imprecise in the one case
-    // where a scene explicitly restates the default, which is harmless
-    // because the result is the same either way.
-    std::string scene_default = "earth";
+    // Which scene Init() seeds when a fixture does not supply its own. The
+    // game-like default is `spheres_csg` -- three analytic spheres on a grey
+    // plane plus the drilled-cube CSG mesh; `none` seeds neither (equivalent
+    // to setting both pt_smoke_skip_prim_seed and pt_smoke_skip_csg_seed).
+    std::string scene_default = "spheres_csg";
     if (auto* v = C.FindCVar("r_scene_default")) scene_default = v->value;
-    // Returns true when the seed actually wrote -- i.e. the scene had no
-    // opinion. Callers that need to know include the stand-on-the-surface
-    // request: a fixture that placed its own camera (planet_aerial.cfg puts
-    // it at 4 km) must not have it snapped back to eye height.
-    //
-    // The test is CVar::assigned, not `value == default_value`. The latter
-    // cannot tell "untouched" from "explicitly set to the default value",
-    // and that difference is load-bearing here: r_planet_terrain's default
-    // IS 0, so a fixture or an --extra turning terrain OFF in an
-    // r_scene_default=earth scene had its choice silently overwritten by
-    // this seed. Measuring the "feature deleted" signal for the golden
-    // tolerances is what surfaced it -- terrain-off came out pixel-identical
-    // to terrain-on, because terrain had never actually been turned off.
+    // seed_cvar writes a cvar ONLY when the scene had no opinion (the cvar
+    // is unassigned), so a fixture's own value always wins.
     auto seed_cvar = [&C](const char* name, const char* value) {
         if (auto* v = C.FindCVar(name)) {
             if (!v->assigned) { v->value = value; return true; }
         }
         return false;
     };
-    const bool seed_earth = (scene_default == "earth");
-    const bool seed_none  = (scene_default == "none");
-    if (seed_earth) {
-#if PT_PLANET_ENABLED
-        seed_cvar("r_planet_terrain", "1");
-        seed_cvar("r_planet_spherical_frame", "1");
-        seed_cvar("r_planet_ground", "1");
-        seed_cvar("r_planet_ocean", "1");
-        // --- The sky half of "a real planet" (#306) --------------------
-        //
-        // Until now the earth seed built a planet and then hung the
-        // bundled sunset.hdr behind it: r_sky_mode's default is `hdri`,
-        // so the default scene was a real globe inside a painted studio
-        // backdrop, with no clouds and no aerial perspective.
-        //
-        // physical is the ONLY mode with an unlimited altitude range --
-        // the other four are domes, functions of view direction with the
-        // observer implicitly at ground level, and they return the same
-        // zenith colour at eye height and at 400 km. A default scene
-        // whose whole point is that you can fly off it cannot be built
-        // on one. Choosing it here also settles #306's "no mode switch
-        // the user can see": there is no altitude at which anything
-        // switches, because there is only ever one mode.
-        //
-        // It also makes the skybox question moot rather than answered
-        // twice -- push.env_map_present is (sky_mode_id == 1u), i.e. the
-        // env map is sampled ONLY in hdri mode, so selecting physical
-        // already guarantees no env-map backdrop and no env NEE. That is
-        // why r_env_map itself is deliberately NOT seeded: forcing it
-        // empty would take the HDRI away from a user who later asks for
-        // `cvar set r_sky_mode hdri`, and would buy nothing here.
-        seed_cvar("r_sky_mode", "physical");
-        // Aerial perspective over the disc and haze at the surface: the
-        // camera-to-surface air is integrated by the volumetric march,
-        // not by skyPhysical (which only owns primary MISSES). Without
-        // this the ground is extinguished but never in-scattered into,
-        // which is the "dark body with no haze over it" failure.
-        seed_cvar("r_volumetric", "1");
-        // Clouds resolve to a spherical shell whenever a planet is
-        // present (cloudLayerInterval -> ptRayShell against R + base /
-        // R + top), so the default cumulus deck is geometrically valid
-        // from eye height and from orbit alike.
-        seed_cvar("r_clouds", "1");
-        // Already the registered default (1); stated so the earth seed
-        // is a complete description of the scene rather than a partial
-        // one that silently depends on another cvar's default not
-        // moving. Verified a no-op: seed_cvar only writes when the cvar
-        // is unassigned, and it writes the value it already holds.
-        seed_cvar("r_show_stars", "1");
-        // The planet IS the scene; the historical grey plane at y = 0
-        // would sit above the ellipsoid everywhere except the tangent
-        // point and paint a flat-Earth horizon over it -- the same reason
-        // planet_horizon_clouds.cfg skips the prim seed.
-        seed_cvar("pt_smoke_skip_prim_seed", "1");
-        seed_cvar("pt_smoke_skip_csg_seed", "1");
-        // Eye height on the reference site, looking level at the horizon.
-        // cam_pos / cam_pitch are read into the camera further down in
-        // Init; the y here is a placeholder, because the real ground height
-        // is not knowable until the terrain streamer exists. The stand
-        // request below is what actually places the camera, on the first
-        // frame the streamer is live.
-        const bool placed_camera = seed_cvar("cam_pos", "0 1.7 0");
-        seed_cvar("cam_pitch", "0");
-        if (placed_camera) seed_cvar("r_planet_stand_eye", "1.7");
-#else
-        LOG_WARN("engine: r_scene_default=earth but this build has "
-                 "PT_PLANET_ENABLED=OFF; falling back to the analytic seed");
-#endif
-    } else if (seed_none) {
+    const bool seed_none = (scene_default == "none");
+    if (seed_none) {
         seed_cvar("pt_smoke_skip_prim_seed", "1");
         seed_cvar("pt_smoke_skip_csg_seed", "1");
     }
-    // --- end Planetary P4 -------------------------------------------------
     bool skip_csg_seed = false;
     if (auto* v = C.FindCVar("pt_smoke_skip_csg_seed")) skip_csg_seed = v->GetBool();
     if (!skip_csg_seed) {
@@ -3465,52 +3024,6 @@ void Engine::ApplyCommandLineCvarOverrides() {
 }
 
 void Engine::Shutdown() {
-    // --- Planetary P4 (#258) ---------------------------------------------
-    // FIRST, before anything else touches the device. The terrain streamer
-    // owns per-chunk BLASes and two storage buffers and joins a worker pool
-    // in its shutdown, and Engine::Shutdown releases `device_` further down.
-    // Leaving the streamer to its own destructor put its DestroyAccelStruct
-    // calls after the Metal device had already gone -- which surfaced as
-    // `mutex lock failed: Invalid argument` at process exit, i.e. locking
-    // the dead device's resource mutex. Explicit ordering, not member
-    // declaration order, because the latter is easy to perturb.
-    if (planet_terrain_) {
-        // The streaming claim, measured. P0 (#254) added
-        // AccelGpuStallCount so a test could assert the ABSENCE of a drain
-        // rather than infer it from wall-clock timing on a shared runner;
-        // this is the same instrument pointed at the same claim in the
-        // subsystem that actually exercises it.
-        LOG_INFO("planet: streaming totals -- {} chunk BLAS builds, "
-                 "{} TLAS republishes ({} full rebuilds), "
-                 "{} stalls attributable to republishes, "
-                 "{} device stalls total",
-                 planet_terrain_->Stats().blas_builds,
-                 planet_tlas_publishes_, planet_tlas_rebuilds_,
-                 planet_tlas_stalls_,
-                 device_ ? device_->AccelGpuStallCount()
-                         : static_cast<std::uint64_t>(0));
-        // The residency policy's own ledger. `peak` against
-        // r_planet_chunk_budget is the statement that holding an outgoing
-        // chunk alongside its replacement never overran the arena; the two
-        // fallback counters are the times the streamer chose a hole over a
-        // crack or over an overrun, and a session that reports many of
-        // either is a session whose budget is too tight for its camera.
-        LOG_INFO("planet: residency -- peak {} of {} arena slots resident "
-                 "({} leaves + {} retained ancestors), "
-                 "{} stand-ins released under arena pressure, "
-                 "{} retained ancestors released, "
-                 "{} refused to avoid a two-level step",
-                 planet_terrain_->Stats().resident_peak,
-                 planet_terrain_->ArenaSlots(),
-                 planet_terrain_->LeafBudget(),
-                 planet_terrain_->ArenaSlots() - planet_terrain_->LeafBudget(),
-                 planet_terrain_->Stats().holds_dropped,
-                 planet_terrain_->Stats().retained_dropped,
-                 planet_terrain_->Stats().holds_refused);
-        planet_terrain_->Shutdown();
-        planet_terrain_.reset();
-    }
-    // --- end Planetary P4 -------------------------------------------------
     // Stop the audio device first so its worker thread is gone before
     // the rest of the engine state it doesn't strictly depend on
     // (overlay sinks, console server, jobs) starts unwinding. Idempotent
@@ -3635,15 +3148,6 @@ void Engine::TearDownDevice() {
             if (ocean_normal_tex_id_[i] != 0)
                 device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[i]});
         }
-        // --- #259 / #133 Phase 2: the GPU cascade solver's buffers ---------
-        if (ocean_gpu_h0_buf_id_ != 0)
-            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_h0_buf_id_});
-        if (ocean_gpu_scratch_buf_id_ != 0)
-            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_scratch_buf_id_});
-        if (ocean_gpu_foam_buf_id_ != 0)
-            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_foam_buf_id_});
-        if (ocean_gpu_reduce_buf_id_ != 0)
-            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_reduce_buf_id_});
         // --- end Wave 8 ocean ------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
@@ -3747,29 +3251,7 @@ void Engine::TearDownDevice() {
     }
     ocean_tex_slot_      = 0;
     ocean_tex_grid_      = 0;
-    // Planetary P5 (#259): the cascade count is part of the atlas's shape,
-    // so it has to be forgotten with the handles or EnsureOceanUploaded
-    // would think a fresh device already had the right texture.
-    ocean_tex_cascades_  = 0;
     ocean_tex_ring_      = 0;
-    // --- #259 / #133 Phase 2 -----------------------------------------------
-    // The GPU solver's buffers and its pipeline belong to the device that
-    // is going away. Forgetting the buffer shape and the uploaded spectrum
-    // revisions is what makes EnsureOceanGpuResources rebuild on the next
-    // device instead of binding handles that no longer exist; the foam
-    // accumulator restarts from zero, which is the same thing a grid-size
-    // change does and is the honest state for a fresh device.
-    ocean_gpu_pipeline_id_    = 0;
-    ocean_gpu_h0_buf_id_      = 0;
-    ocean_gpu_scratch_buf_id_ = 0;
-    ocean_gpu_foam_buf_id_    = 0;
-    ocean_gpu_reduce_buf_id_  = 0;
-    ocean_gpu_buf_grid_       = 0;
-    ocean_gpu_buf_cascades_   = 0;
-    for (int i = 0; i < 3; ++i) ocean_gpu_spectrum_rev_[i] = 0u;
-    ocean_gpu_pending_        = false;
-    ocean_gpu_owns_field_     = false;
-    ocean_gpu_last_t_         = -1.0;
     // --- end Wave 8 ocean -------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
@@ -6546,13 +6028,6 @@ void Engine::EnsurePipelineHandles() {
     // run compute pipelines anyway.
     resolve(clouds_raymarch_pipeline_id_,  "clouds_raymarch");
     resolve(clouds_composite_pipeline_id_, "clouds_composite");
-    // Planetary P5 (#259) / #133 Phase 2: the ocean cascade FFT pre-pass.
-    // Metal-only at this scope -- VulkanDevice's shared descriptor-set
-    // layout does not declare bindings 40..45, and adding them is a change
-    // no Vulkan device in this arc has ever executed (#290). Software
-    // returns a non-zero id for any name, so OceanGpuAvailable() gates on
-    // the BACKEND as well as on this id.
-    resolve(ocean_gpu_pipeline_id_, "ocean_cascades");
     // SIGMA shadow denoiser (issue #115). Metal-only at MVP scope;
     // r_shadow_demod gate collapses to "no SIGMA" on Vulkan.
     resolve(sigma_shadow_pipeline_id_, "sigma_shadow");
@@ -6984,406 +6459,6 @@ void Engine::PrewarmPipelines() {
 }
 
 
-// Planetary P1 (#255). Recompute the render frame's anchor for this
-// frame. MUST run before any Ensure*Uploaded pack and before the PtPush
-// fill -- see the call site at the top of RenderFrame.
-// --- Planetary P4 (#258): terrain streaming -------------------------------
-
-double Engine::TerrainAltitude(const glm::dvec3& p_world) const {
-#if PT_PLANET_ENABLED
-    if (planet_terrain_ && planet_terrain_->Ready()) {
-        return planet_terrain_->AltitudeAboveTerrain(p_world);
-    }
-#endif
-    // No terrain: the engine's historical ground is the y = 0 plane, so
-    // "altitude" is y. Every pre-#258 scene keeps that meaning.
-    return p_world.y;
-}
-
-void Engine::UpdatePlanetTerrain() {
-#if PT_PLANET_ENABLED
-    if (!device_ || !camera_) return;
-    auto& C = pt::console::Console::Get();
-    auto fget = [&](const char* n, double d) {
-        if (auto* v = C.FindCVar(n)) return static_cast<double>(v->GetFloat());
-        return d;
-    };
-    auto iget = [&](const char* n, int d) {
-        if (auto* v = C.FindCVar(n)) return v->GetInt();
-        return d;
-    };
-    bool want = false;
-    if (auto* v = C.FindCVar("r_planet_terrain")) want = v->GetBool();
-
-    // Structural parameters: changing one means new arenas, a new site or a
-    // new field, so the streamer restarts rather than trying to migrate.
-    pt::engine::TerrainConfig cfg{};
-    cfg.enabled      = want;
-    constexpr double kDeg2Rad = 0.017453292519943295;
-    cfg.site_lat_rad = fget("r_planet_site_lat", 0.0) * kDeg2Rad;
-    cfg.site_lon_rad = fget("r_planet_site_lon", 0.0) * kDeg2Rad;
-    cfg.worker_count = iget("r_planet_workers", 4);
-    cfg.blas_budget_ms = fget("r_planet_blas_budget_ms", 2.0);
-    if (auto* v = C.FindCVar("r_planet_dem")) cfg.dem_path = v->value;
-    cfg.field.hurst               = fget("r_planet_hurst", 0.5);
-    cfg.field.hurst_fine          = fget("r_planet_hurst_fine", 1.0);
-    cfg.field.hillslope_break_m   = fget("r_planet_hillslope_break", 106.0);
-    cfg.field.detail_gain         = fget("r_planet_detail_gain", 1.0);
-    cfg.field.max_slope           = fget("r_planet_max_slope", 1.0);
-    cfg.field.procedural_relief_m = fget("r_planet_procedural_relief", 900.0);
-    cfg.lod.tau_px       = fget("r_planet_lod_error_px", 0.5);
-    cfg.lod.hysteresis   = fget("r_planet_lod_hysteresis", 1.4);
-    cfg.lod.min_level    = iget("r_planet_lod_min_level", 0);
-    cfg.lod.max_level    = iget("r_planet_lod_max_level", pt::planet::kMaxLevel);
-    cfg.lod.chunk_budget = iget("r_planet_chunk_budget", 1024);
-
-    const bool have = planet_terrain_ && planet_terrain_->Ready();
-    bool restart = false;
-    if (want != have) restart = true;
-    if (have && planet_terrain_) {
-        const auto& s = planet_terrain_->Site();
-        if (std::abs(s.lat_rad - cfg.site_lat_rad) > 1e-12 ||
-            std::abs(s.lon_rad - cfg.site_lon_rad) > 1e-12) restart = true;
-        // r_planet_chunk_budget is the LEAF cap; the arena that follows
-        // from it is WholeCutSlots of that, because residency is the whole
-        // cut and not its frontier (#319). Comparing the cvar against the
-        // TLAS capacity directly would report a mismatch on every frame and
-        // restart the streamer forever.
-        if (planet_terrain_->LeafBudget() !=
-            static_cast<std::uint32_t>(std::clamp(cfg.lod.chunk_budget, 8, 8192))) {
-            restart = true;
-        }
-        if (std::abs(planet_terrain_->Field().Params().hurst - cfg.field.hurst) > 1e-12 ||
-            std::abs(planet_terrain_->Field().Params().hurst_fine -
-                     cfg.field.hurst_fine) > 1e-12 ||
-            std::abs(planet_terrain_->Field().Params().hillslope_break_m -
-                     cfg.field.hillslope_break_m) > 1e-9 ||
-            std::abs(planet_terrain_->Field().Params().detail_gain - cfg.field.detail_gain) > 1e-12 ||
-            std::abs(planet_terrain_->Field().Params().max_slope - cfg.field.max_slope) > 1e-12 ||
-            std::abs(planet_terrain_->Field().Params().procedural_relief_m -
-                     cfg.field.procedural_relief_m) > 1e-9) {
-            restart = true;
-        }
-    }
-    if (restart) {
-        if (planet_terrain_) {
-            // The streamer owns BLASes the TLAS is still referencing, so
-            // the TLAS has to go first and the device has to be quiet.
-            device_->WaitIdle();
-            if (scene_tlas_id_ != 0) {
-                device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{scene_tlas_id_});
-                scene_tlas_id_ = 0;
-                scene_tlas_capacity_ = 0;
-            }
-            planet_terrain_->Shutdown();
-        }
-        if (want) {
-            if (!planet_terrain_) {
-                planet_terrain_ = std::make_unique<pt::engine::PlanetTerrain>();
-            }
-            if (!planet_terrain_->Init(device_.get(), cfg)) {
-                planet_terrain_.reset();
-                if (auto* v = C.FindCVar("r_planet_terrain")) v->value = "0";
-            }
-        } else {
-            planet_terrain_.reset();
-        }
-        // A fresh streamer has an empty quadtree, so the capture barrier
-        // has to run again. Without this a mid-run r_planet_terrain toggle
-        // would capture whatever the new streamer managed on its first
-        // frame -- the exact failure the barrier exists to remove.
-        planet_settled_ = false;
-        planet_settle_flush_ = false;
-        accum_dirty_ = true;
-    }
-    if (!planet_terrain_ || !planet_terrain_->Ready()) return;
-
-    // A pending "stand on the surface" request, from the `earth` scene seed
-    // or from the planet_stand command. It cannot be serviced at seed time
-    // because the streamer does not exist yet and the terrain height is a
-    // function of the field it owns.
-    //
-    // This is what "the camera is at eye height" has to mean once the
-    // ground is a height field. The engine's y = 0 is the ellipsoid at the
-    // reference SITE, and the terrain there is at Everest's 8 849 m with a
-    // real DEM and at whatever the fractal produced without one -- so a
-    // literal cam_pos 0 1.7 0 leaves the camera either buried or hundreds
-    // of metres in the air. The first run of the planet_surface fixture
-    // showed exactly that: a horizon arc far too curved for a 1.7 m eye,
-    // because the eye was ~300 m up.
-    if (planet_stand_eye_m_ < 0.0 && !planet_stand_done_) {
-        if (auto* v = C.FindCVar("r_planet_stand_eye")) {
-            planet_stand_eye_m_ = static_cast<double>(v->GetFloat());
-        }
-    }
-    if (planet_stand_eye_m_ >= 0.0 && camera_) {
-        camera_->pos_w =
-            planet_terrain_->SurfacePosition(camera_->pos_w, planet_stand_eye_m_);
-        LOG_INFO("planet: camera placed {:.2f} m above the terrain at "
-                 "({:.1f}, {:.1f}, {:.1f})",
-                 planet_stand_eye_m_, camera_->pos_w.x, camera_->pos_w.y,
-                 camera_->pos_w.z);
-        planet_stand_eye_m_ = -1.0;
-        planet_stand_done_  = true;
-        accum_dirty_ = true;
-    }
-
-    // Non-structural parameters ride in on every Update.
-    pt::planet::LodParams lod = cfg.lod;
-    lod.camera_w = camera_->pos_w;
-    // cone_spread = 2 * tan(fovY/2) / height -- the EXACT expression
-    // PathTrace.slang computes per camera sample, evaluated once on the
-    // host. Sharing the expression rather than a constant is what makes the
-    // "transitions are sub-pixel" claim mean the same thing on both sides.
-    const auto h = static_cast<double>(std::max(1, window_ ? window_->Height() : 1080));
-    lod.cone_spread = 2.0 * static_cast<double>(camera_->FovYTan()) / h;
-    if (auto* v = C.FindCVar("r_planet_lod_freeze")) lod.freeze = v->GetBool();
-    // The analytic backstop the from-orbit cull (#326) measures against. It
-    // is unconditionally present while terrain streams (the branch above that
-    // fills planet_ground.w forces planet_ground_on when terrain is on), so
-    // the selector can always fall a sub-pixel chunk back onto it. The one
-    // radius, from pt::planet::kBackstopRadius, so the cull and the shader
-    // agree on where the backstop is. The body centre goes with it so the
-    // cull can measure the camera's geocentric distance in the same canonical
-    // frame camera_w lives in.
-    lod.backstop_radius_m = pt::planet::kBackstopRadius;
-    lod.planet_center_w   = planet_terrain_->Site().CenterWorld();
-
-    const bool changed = planet_terrain_->Update(lod, world_frame_.anchor);
-    // A CSG rebake destroys the scene TLAS and recreates it at capacity 1
-    // (RebuildMeshResources knows nothing about terrain), so a capacity
-    // mismatch has to force a republish even on a frame where residency
-    // did not move -- otherwise the planet would silently vanish for as
-    // long as the camera held still.
-    if (changed || scene_tlas_capacity_ != planet_terrain_->TlasCapacity()) {
-        PublishSceneTlas();
-    }
-
-    // --- Capture settle barrier (#284) ------------------------------------
-    //
-    // Only ever engages in smoke mode; an interactive session must never
-    // stop to wait for a planet to finish streaming.
-    //
-    // This used to be a gate rather than a barrier: the engine rendered
-    // ordinary frames, checked `converged` after each one, and gave up
-    // after pt_planet_settle of them. Rendering frames does not MAKE chunks
-    // bake, so that was a race between the frame rate and the bake rate,
-    // and the loser was whoever the machine happened to be. Debug lost it
-    // on every run -- 400 frames spent, 149 / 220 / 155 chunks resident on
-    // three consecutive captures of planet_surface, three different images
-    // -- and Release lost it occasionally. Both cases ended in a warning
-    // that the capture was not deterministic, and then captured anyway.
-    //
-    // PlanetTerrain::Settle drives the selector to its fixed point instead,
-    // one bake round per iteration, and the round count is a property of
-    // the quadtree rather than of the clock. The budget below is now a
-    // bound on ROUNDS -- a safety net against a scene that genuinely cannot
-    // converge, not a schedule that a slow machine can exhaust.
-    int settle_rounds = 0;
-    if (auto* v = C.FindCVar("pt_planet_settle_rounds")) settle_rounds = v->GetInt();
-    const bool want_settle = smoke_fixed_dt_active_ && settle_rounds > 0;
-    if (want_settle && !planet_settled_) {
-        const bool ok = planet_terrain_->Settle(lod, world_frame_.anchor,
-                                                settle_rounds);
-        planet_settled_ = true;
-        // The frame the barrier ran in does not count against the smoke
-        // budget and does not advance the sample sequence: it observed the
-        // world mid-settle, and `frame_index_` seeds the path tracer's
-        // sample hash. Same contract as a loading frame.
-        planet_settling_ = true;
-        // Discard the accumulator so the capture starts clean against the
-        // FINAL frozen geometry rather than blending the intermediate one
-        // this frame began with. The flush flag repeats the discard on the
-        // first frame that COUNTS, because this frame may or may not have
-        // reached the dispatch -- see planet_settle_flush_ in Engine.h.
-        accum_dirty_ = true;
-        planet_settle_flush_ = true;
-        PublishSceneTlas();
-        if (ok) {
-            // BOTH digests, because neither alone is the claim. The desired
-            // digest says two runs picked the same chunks; the scene digest
-            // says they also laid them out the same way in the arena, which
-            // is what #284 turned out to hinge on.
-            LOG_INFO("planet: residency converged after {} settle round(s) "
-                     "({} chunks resident, desired {:016x}, scene {:016x}, "
-                     "{} BLAS builds)",
-                     planet_terrain_->SettleRounds(),
-                     planet_terrain_->Stats().resident,
-                     planet_terrain_->Stats().desired_digest,
-                     planet_terrain_->Stats().scene_digest,
-                     planet_terrain_->Stats().blas_builds);
-        } else {
-            // Report rather than hang. Unlike the old frame budget this
-            // should be unreachable for a well-formed scene: a round
-            // consumes a level of the descent, so the count is bounded by
-            // r_planet_lod_max_level and the drain batching, neither of
-            // which moves with machine speed.
-            LOG_WARN("planet: residency did not converge within "
-                     "pt_planet_settle_rounds={} ({} resident / {} desired, "
-                     "{} pending) -- this capture is NOT deterministic",
-                     settle_rounds, planet_terrain_->Stats().resident,
-                     planet_terrain_->Stats().desired,
-                     planet_terrain_->Stats().pending_bakes);
-        }
-    } else {
-        if (planet_settle_flush_) {
-            // First frame after the barrier, and the first one that counts.
-            // Throw away whatever the barrier frame did or did not leave in
-            // the accumulator, so the capture is exactly the counted frames.
-            accum_dirty_ = true;
-            planet_settle_flush_ = false;
-        }
-        planet_settling_ = false;
-    }
-#endif  // PT_PLANET_ENABLED
-}
-
-void Engine::PublishSceneTlas() {
-#if PT_PLANET_ENABLED
-    if (!device_) return;
-    if (!planet_terrain_ || !planet_terrain_->Ready()) return;
-
-    const auto& terrain = planet_terrain_->Instances();
-    const std::uint32_t capacity = planet_terrain_->TlasCapacity();
-
-    // Instance 0 is reserved for the CSG / glTF mesh. When there is no mesh
-    // the slot is simply absent from the array -- instance_id is a user
-    // value, not an array index, so the terrain's ids stay 1..N either way
-    // and the descriptor buffer needs no hole.
-    std::vector<pt::rhi::TLASInstance> insts;
-    insts.reserve(capacity);
-    if (box_blas_id_ != 0) {
-        pt::rhi::TLASInstance mesh{};
-        mesh.blas = pt::rhi::AccelStructHandle{box_blas_id_};
-        // Identity, for the reason P1 (#255) documented at
-        // RebuildMeshResources: CsgScene bakes into ABSOLUTE world
-        // coordinates, so the mesh's placement stays whole in the
-        // mesh_motion ray-origin shift. Terrain is chunk-local from the
-        // start and therefore does put its placement here.
-        mesh.transform[0] = 1; mesh.transform[5] = 1; mesh.transform[10] = 1;
-        mesh.instance_id = 0;
-        mesh.mask = 0xFF;
-        insts.push_back(mesh);
-    }
-    for (const auto& i : terrain) insts.push_back(i);
-    if (insts.empty()) return;
-
-    // Pad to the FULL capacity with masked copies of the first instance.
-    //
-    // This is not cosmetic. Metal's UpdateTLASInstances re-queries
-    // accelerationStructureSizes against the new descriptor and refuses the
-    // update if it needs more storage than the structure was built with; a
-    // TLAS created at N=1 and updated to N=1025 would be rejected every
-    // frame. Holding the instance COUNT constant holds the storage
-    // requirement constant, so the update path is always available. mask=0
-    // means a ray can never intersect the padding.
-    const pt::rhi::TLASInstance pad_src = insts.front();
-    while (insts.size() < capacity) {
-        pt::rhi::TLASInstance pad = pad_src;
-        pad.mask = 0u;
-        pad.instance_id = 0u;
-        insts.push_back(pad);
-    }
-
-    const std::uint64_t stalls_before = device_->AccelGpuStallCount();
-    if (scene_tlas_id_ != 0 && scene_tlas_capacity_ == capacity) {
-        if (device_->UpdateTLASInstances(pt::rhi::AccelStructHandle{scene_tlas_id_},
-                                         insts)) {
-            planet_stall_baseline_ = device_->AccelGpuStallCount() - stalls_before;
-            ++planet_tlas_publishes_;
-            planet_tlas_stalls_ += planet_stall_baseline_;
-            return;
-        }
-        // The update refused (unknown handle, capacity, or a backend
-        // without the verb). Fall through to a full rebuild rather than
-        // silently rendering last frame's residency.
-        LOG_WARN("planet: UpdateTLASInstances refused {} instances; rebuilding",
-                 insts.size());
-    }
-    device_->WaitIdle();
-    if (scene_tlas_id_ != 0) {
-        device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{scene_tlas_id_});
-        scene_tlas_id_ = 0;
-    }
-    pt::rhi::TLASDesc desc{};
-    desc.instances = insts;
-    // AllowUpdate is what makes the per-frame republish take the cheap
-    // path; without it every frame would be a full rebuild into the same
-    // storage, which still works but pays more.
-    desc.flags = pt::rhi::AccelBuildFlags::PreferFastTrace |
-                 pt::rhi::AccelBuildFlags::AllowUpdate;
-    desc.debug_name = "scene";
-    const auto tlas = device_->CreateTLAS(desc);
-    scene_tlas_id_ = tlas.id;
-    scene_tlas_capacity_ = (tlas.id != 0) ? capacity : 0u;
-    ++planet_tlas_rebuilds_;
-    if (tlas.id == 0) {
-        LOG_ERROR("planet: scene TLAS creation failed at capacity {}", capacity);
-    }
-#endif  // PT_PLANET_ENABLED
-}
-
-void Engine::EnsureInstanceDescriptors() {
-#if PT_PLANET_ENABLED
-    if (!device_) return;
-    // Descriptor 0 is always present and always carries exactly what
-    // PathTrace.slang used to inline for a mesh hit. That is the
-    // bit-identity guarantee: with PT_PLANET_ENABLED on and no planet in
-    // the scene, the shader's descriptor read resolves to these values and
-    // the pixels are unchanged.
-    std::vector<float> data(static_cast<std::size_t>(pt::engine::kInstDescFloat4s) * 4u, 0.0f);
-    auto put_u = [](float* p, std::uint32_t v) { std::memcpy(p, &v, sizeof(float)); };
-    put_u(data.data() + 0, pt::engine::kInstKindMesh);
-    put_u(data.data() + 1, 0u);
-    put_u(data.data() + 2, 0u);
-    data[3] = 0.0f;                       // uv_scale: 0 = mip 0, as before
-    // MESH_ALBEDO in PathTrace.slang: float3(1.00, 0.85, 0.45), gold metal.
-    data[4] = 1.00f; data[5] = 0.85f; data[6] = 0.45f;
-    data[7] = 0.05f;                      // the hard-coded mesh roughness
-    put_u(data.data() + 8, 1u /* MAT_METAL */);
-    data[9] = 0.0f; data[10] = 1.0f; data[11] = 0.0f;
-    put_u(data.data() + 12, mesh_albedo_tex_);
-    put_u(data.data() + 13, mesh_normal_tex_);
-    put_u(data.data() + 14, mesh_roughness_tex_);
-    put_u(data.data() + 15, mesh_metallic_tex_);
-
-    if (planet_terrain_ && planet_terrain_->Ready()) {
-        const auto& terr = planet_terrain_->DescriptorFloats();
-        data.insert(data.end(), terr.begin(), terr.end());
-    }
-
-    const auto needed = static_cast<std::uint32_t>(
-        data.size() / (pt::engine::kInstDescFloat4s * 4u));
-    if (instance_desc_id_ == 0 || needed > instance_desc_capacity_) {
-        if (instance_desc_id_ != 0) {
-            device_->WaitIdle();
-            device_->DestroyBuffer(pt::rhi::BufferHandle{instance_desc_id_});
-            instance_desc_id_ = 0;
-        }
-        // Grow to the TLAS capacity in one go rather than reallocating as
-        // chunks stream in -- 1025 descriptors is 98 KB.
-        std::uint32_t cap = needed;
-        if (planet_terrain_ && planet_terrain_->Ready()) {
-            cap = std::max(cap, planet_terrain_->TlasCapacity());
-        }
-        auto buf = device_->CreateBuffer({
-            .size = static_cast<std::size_t>(cap) * pt::engine::kInstDescFloat4s * 4u
-                    * sizeof(float),
-            .usage = pt::rhi::BufferUsage::Storage,
-            .debug_name = "instance_desc",
-        });
-        if (buf.id == 0) {
-            LOG_ERROR("planet: instance descriptor buffer allocation failed ({} entries)", cap);
-            return;
-        }
-        instance_desc_id_ = buf.id;
-        instance_desc_capacity_ = cap;
-    }
-    device_->WriteBuffer(pt::rhi::BufferHandle{instance_desc_id_},
-                         data.data(), data.size() * sizeof(float));
-#endif  // PT_PLANET_ENABLED
-}
-
 // --- #280: the multiple-scattering table --------------------------------
 //
 // Hillaire 2020 section 4's Psi_ms(r, mu_s), 32 x 32, built on the CPU into
@@ -7465,80 +6540,6 @@ void Engine::EnsureAtmosphereMultiScatterLut() {
              static_cast<double>(key.ground_albedo));
 }
 
-// --- Land cover (#300): the surface albedo raster ---------------------------
-//
-// Load once, upload once, and key the reload on the PATH rather than on a
-// dirty flag anyone can forget to set. The raster is immutable data, so
-// unlike the multiple-scattering LUT there is nothing to rebuild per frame
-// -- the whole function is a no-op after the first call unless
-// r_planet_albedo_map changes.
-void Engine::EnsureLandAlbedoRaster() {
-    if (device_ == nullptr) return;
-    auto& C = pt::console::Console::Get();
-    std::string path;
-    if (auto* v = C.FindCVar("r_planet_albedo_map")) path = v->value;
-
-    if (path == land_albedo_key_ && land_albedo_loaded_) return;
-    land_albedo_key_    = path;
-    land_albedo_loaded_ = true;
-    land_albedo_map_    = pt::planet::SurfaceAlbedoMap{};
-
-    if (path.empty()) {
-        LOG_INFO("planet: no land-cover raster (r_planet_albedo_map is "
-                 "empty) -- terrain uses the procedural classification");
-        return;
-    }
-    // RESOLVE, do not trust the literal. r_planet_albedo_map's default is a
-    // repo-relative path, and the golden matrix runs every cell in its own
-    // working directory (golden_workdir/golden_<stem>/) so that cells cannot
-    // scribble on each other. A relative open therefore fails there and
-    // ONLY there -- the raster silently does not load, the terrain falls to
-    // the procedural classification, and the cell renders exactly the
-    // r_planet_land_albedo 0 ablation while every manual render from the
-    // repo root looks right. That is precisely how this was found: the
-    // golden diff came back bit-for-bit equal to the ablation image.
-    // r_planet_dem has gone through ResolveAssetPath since #258 for the
-    // same reason.
-    const std::string resolved = pt::ResolveAssetPath(path.c_str());
-    std::string err;
-    if (!land_albedo_map_.Load(resolved, err)) {
-        // ONE LOUD LINE, not a silent substitution. The DEM path already
-        // took this position and it is the same argument: a render that
-        // quietly falls back to a procedural body is a render nobody can
-        // tell apart from the real one until they compare coastlines.
-        LOG_WARN("planet: land-cover raster not loaded ({}) -- terrain falls "
-                 "back to the PROCEDURAL classification, so this is not "
-                 "Earth's land cover. Bake it with "
-                 "tools/fetch_planet_albedo.py.", err);
-        return;
-    }
-    const auto& packed = land_albedo_map_.Packed();
-    const std::size_t bytes = packed.size() * sizeof(std::uint32_t);
-    if (land_albedo_buf_id_ == 0) {
-        auto buf = device_->CreateBuffer({
-            .size = bytes,
-            .usage = pt::rhi::BufferUsage::Storage,
-            .debug_name = "land_albedo",
-        });
-        if (buf.id == 0) {
-            LOG_ERROR("planet: land-cover raster buffer allocation failed "
-                      "({} MB)", bytes / (1024.0 * 1024.0));
-            land_albedo_map_ = pt::planet::SurfaceAlbedoMap{};
-            return;
-        }
-        land_albedo_buf_id_ = buf.id;
-    }
-    device_->WriteBuffer(pt::rhi::BufferHandle{land_albedo_buf_id_},
-                         packed.data(), bytes);
-    LOG_INFO("planet: land-cover raster {} -- {}x{}, {:.2f} MB, {}",
-             resolved, land_albedo_map_.Width(), land_albedo_map_.Height(),
-             bytes / (1024.0 * 1024.0),
-             land_albedo_map_.IsMeasuredAlbedo()
-                 ? "MEASURED albedo (MODIS MCD43 per-band)"
-                 : "radiance-derived (see assets/planet/PROVENANCE.md for "
-                   "what that costs)");
-}
-
 void Engine::UpdateWorldFrame() {
     // ========================================================================
     // PLANETARY P1 (#255) -- THE CONVERSION BOUNDARY
@@ -7612,12 +6613,7 @@ void Engine::UpdateWorldFrame() {
         // worldframe_ecef fixtures' "the anchor is EXACTLY the offset"
         // property intact -- those scenes have no terrain and their whole
         // point is a bit-exact equality.
-        double content_scale = 0.0;
-#if PT_PLANET_ENABLED
-        if (planet_terrain_ && planet_terrain_->Ready()) {
-            content_scale = std::max(TerrainAltitude(camera_->pos_w), 0.0);
-        }
-#endif
+        const double content_scale = 0.0;
         const glm::dvec3 next_anchor =
             pt::core::ComputeAnchor(camera_->pos_w, rebase_radius, content_scale);
         world_frame_.anchor_prev = world_frame_.anchor;
@@ -7723,22 +6719,6 @@ void Engine::RenderFrame() {
     // DEVICE_LOST. Some drivers may mask the race with memory zeroing or
     // lax OOB handling, so keep this guard explicit.
     EnsureMeshUpdated();
-    // --- Planetary P4 (#258): terrain streaming -------------------------
-    // One selector / bake-drain / build / publish round. Runs AFTER
-    // EnsureMeshUpdated so a CSG rebake's fresh BLAS is already the one
-    // PublishSceneTlas puts at instance 0, and BEFORE the dispatch block
-    // that reads scene_tlas_id_ into tlas_present.
-    //
-    // Deliberately NOT inside the loading-frame gate below: that gate
-    // blanks the screen while a CSG bake is in flight, and terrain
-    // streaming runs tens of times a second forever.
-    UpdatePlanetTerrain();
-    // Descriptor 0 is uploaded unconditionally, even with no terrain and
-    // even with r_planet_terrain off. It is what the shader's mesh hit now
-    // reads its material from, so leaving the buffer unwritten would hand
-    // the CSG mesh whatever the placeholder storage happens to contain --
-    // the bit-identity guarantee lives in this call, not in the gate.
-    EnsureInstanceDescriptors();
     const bool mesh_pending = (bake_phase_.load(std::memory_order_acquire) != 0);
     if (pathtrace_pipeline_id_ == 0 || mesh_pending) {
         // Loading frame. Async pipeline build still in flight, so the
@@ -8575,15 +7555,6 @@ void Engine::RenderFrame() {
     }
 
     auto* cb = device_->AcquireCommandBuffer();
-    // --- #259 / #133 Phase 2: the ocean cascade pre-pass -------------------
-    // FIRST in the frame's command buffer, before PathTrace's pipeline is
-    // bound. Two reasons it cannot go anywhere else: BindComputePipeline
-    // clears every staged resource bind on Metal, so slipping another
-    // pipeline in after PathTrace's binds would wipe them; and PathTrace
-    // READS the field this pass writes, so it has to be behind it on the
-    // GPU timeline. Elided entirely (one bool test) unless
-    // StepOceanCascades armed it this frame.
-    DispatchOceanCascades(cb);
     // --- Per-pass GPU timestamps (#320): start this frame's label list -----
     // Ring-keyed by device frame index so the (lagged) resolve pairs each
     // pass duration with the label recorded for THAT frame. The ocean
@@ -8881,59 +7852,20 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot17.id != 0) cb->BindBuffer(17, slot17, 0);
     // --- end Wave 8 PBR ----------------------------------------------------
-#if PT_PLANET_ENABLED
-    // --- Planetary P4 (#258) -- terrain arenas + instance descriptors ------
-    // Engine slots 18/19/20 -> vk::bindings 36/38/39 (37 is GodRays' mask
-    // TEXTURE; images and buffers share one binding number space in set 0).
-    // ALWAYS bind something: these are now the last buffer slots, so Metal
-    // computes the push-constant slot as max-bound + 1 = 21, and leaving one
-    // unbound would collapse it and corrupt every push field -- the same
-    // lesson slots 11..17 already carry. The shader only dereferences the
-    // terrain arenas when a descriptor's kind is kInstKindTerrain, which
-    // the engine only ever writes for a live chunk.
-    pt::rhi::BufferHandle slot18 =
-        (planet_terrain_ && planet_terrain_->VertexBuffer().id != 0)
-            ? planet_terrain_->VertexBuffer()
-            : pt::rhi::BufferHandle{placeholder_storage_id_};
-    pt::rhi::BufferHandle slot19 =
-        (planet_terrain_ && planet_terrain_->IndexBuffer().id != 0)
-            ? planet_terrain_->IndexBuffer()
-            : pt::rhi::BufferHandle{placeholder_storage_id_};
-    pt::rhi::BufferHandle slot20 = (instance_desc_id_ != 0)
-        ? pt::rhi::BufferHandle{instance_desc_id_}
-        : pt::rhi::BufferHandle{placeholder_storage_id_};
-    if (slot18.id != 0) cb->BindBuffer(18, slot18, 0);
-    if (slot19.id != 0) cb->BindBuffer(19, slot19, 0);
-    if (slot20.id != 0) cb->BindBuffer(20, slot20, 0);
-    // --- end Planetary P4 --------------------------------------------------
-#endif
-    // --- #280: multiple-scattering table (engine slot 21 -> vk::binding 46) --
-    // ALWAYS bind something, for the reason slots 18..20 already carry: this
-    // is now the last buffer slot, so a Metal dispatch that left it unbound
-    // would shift what the parsed layout expects. The placeholder is
-    // zero-filled and the shader's ptMsLutReady() reads texel 0's w, which
-    // the zero fill cannot set -- so an unbuilt table contributes exactly
-    // nothing rather than a table of zeroes that would read as "multiple
-    // scattering is negligible here".
+    // --- #280: multiple-scattering table (engine slot 18 -> vk::binding 46) --
+    // With the planetary terrain arenas removed this is the first buffer
+    // slot past mesh_uvs (slot 17) and hence the LAST bound buffer slot, so
+    // a Metal dispatch that left it unbound would shift what the parsed
+    // layout expects (Metal computes the push-constant slot as max-bound +
+    // 1). The placeholder is zero-filled and the shader's ptMsLutReady()
+    // reads texel 0's w, which the zero fill cannot set -- so an unbuilt
+    // table contributes exactly nothing rather than a table of zeroes that
+    // would read as "multiple scattering is negligible here".
     EnsureAtmosphereMultiScatterLut();
-    pt::rhi::BufferHandle slot21 = (atmo_ms_lut_id_ != 0)
+    pt::rhi::BufferHandle slot18 = (atmo_ms_lut_id_ != 0)
         ? pt::rhi::BufferHandle{atmo_ms_lut_id_}
         : pt::rhi::BufferHandle{placeholder_storage_id_};
-    if (slot21.id != 0) cb->BindBuffer(21, slot21, 0);
-    // --- Land cover (#300): albedo raster (engine slot 22 -> binding 47) ----
-    // ALWAYS bind something, for the reason slots 18..21 already carry: this
-    // is now the last buffer slot AND the last one the backends' 24-entry
-    // tables have room for, so a Metal dispatch that left it unbound would
-    // shift the push-constant slot the parsed layout computes as max+1.
-    //
-    // Unlike slot 21 the placeholder needs no readiness convention of its
-    // own: land_basis_e.w carries the raster width and the host writes 0
-    // when nothing loaded, so the shader never indexes this buffer at all.
-    EnsureLandAlbedoRaster();
-    pt::rhi::BufferHandle slot22 = (land_albedo_buf_id_ != 0)
-        ? pt::rhi::BufferHandle{land_albedo_buf_id_}
-        : pt::rhi::BufferHandle{placeholder_storage_id_};
-    if (slot22.id != 0) cb->BindBuffer(22, slot22, 0);
+    if (slot18.id != 0) cb->BindBuffer(18, slot18, 0);
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -9760,12 +8692,7 @@ void Engine::RenderFrame() {
     // their capture on different samples: measured 8.4% bad pixels between
     // runs whose residency digests matched exactly.
     //
-    // Freezing it here is the sample-sequence half of the same idea as
-    // discarding the accumulator on settle frames. Together they make the
-    // capture a pure function of the converged scene rather than of how
-    // long the machine took to get there. Outside smoke mode
-    // planet_settling_ is never true and this is the unchanged expression.
-    push.frame_index   = planet_settling_ ? frame_index_ : frame_index_++;
+    push.frame_index   = frame_index_++;
     // When the denoiser is on it does its own temporal reuse, so we feed
     // it FRESH (un-accumulated) per-frame radiance every dispatch. The
     // shader still writes accum_hdr (so toggling denoiser off picks back
@@ -10484,30 +9411,6 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
             spherical_frame = v->GetBool();
         }
-#if PT_PLANET_ENABLED
-        // Planetary P4 (#258). Streamed terrain IMPLIES the spherical
-        // frame -- the chunks are placed on an ellipsoid centred at
-        // (0, -R_site, 0), so a planar frame would have localUp() and
-        // every altitude query disagreeing with the geometry the ray
-        // query is actually hitting. The cvar's own docstring says so;
-        // this is where it is enforced rather than merely documented.
-        //
-        // The radius the atmosphere shell uses becomes the site's
-        // GEOCENTRIC radius, not the IUGG mean, so the sphere and the
-        // ellipsoid are tangent at the world origin. Away from the site
-        // they diverge -- up to the 21 385 m equatorial bulge at the
-        // antipode -- which is a documented interlock for P6's from-orbit
-        // aerial perspective, not something this phase can close: the
-        // atmosphere model integrates concentric SPHERICAL shells by
-        // construction.
-        const bool terrain_on = planet_terrain_ && planet_terrain_->Ready();
-        if (terrain_on) {
-            spherical_frame = true;
-            planet_radius_m =
-                static_cast<float>(planet_terrain_->Site().site_radius_m);
-            push.sun_extra[3] = planet_radius_m;
-        }
-#endif
         // A zero radius has no centre and no radial direction, so it
         // degenerates to the planar frame regardless of the cvar.
         spherical_frame = spherical_frame && planet_radius_m > 0.0f;
@@ -10529,226 +9432,33 @@ void Engine::RenderFrame() {
         push.planet_center_radius[3] =
             spherical_frame ? static_cast<float>(planet_R_d) : 0.0f;
 
-        // --- Planetary P3 (#257): the analytic planet body --------------
-        // A single sphere of the SAME radius and centre the atmosphere
-        // shell uses. That sharing is the point, not a convenience: the
-        // roadmap's hardest interface (#253 R-D) is that the air and the
-        // ground must agree on one planet centre and radius, or they
-        // disagree about where the horizon is by hundreds of kilometres.
-        // Reading both out of one field makes disagreement unrepresentable
-        // rather than merely discouraged.
-        //
-        // Gated on the spherical frame as well as on its own cvar: with a
-        // planar frame there is no centre to put it at.
-        bool planet_ground_on = false;
-        if (auto* v = C.FindCVar("r_planet_ground")) planet_ground_on = v->GetBool();
-        planet_ground_on = planet_ground_on && spherical_frame;
-        float ground_albedo = 0.18f;
-        if (auto* v = C.FindCVar("r_planet_ground_albedo")) {
-            ground_albedo = v->GetFloat();
-        }
-        ground_albedo = std::clamp(ground_albedo, 0.0f, 1.0f);
-        push.planet_ground[0] = ground_albedo;
-        push.planet_ground[1] = ground_albedo;
-        push.planet_ground[2] = ground_albedo;
-        double ground_body_R = planet_R_d;
-#if PT_PLANET_ENABLED
-        if (terrain_on) {
-            // With terrain streaming, the analytic body stops being the
-            // visible ground and becomes the BACKSTOP the study calls for:
-            // a sphere guaranteed to sit inside every terrain chunk, so a
-            // streaming gap or a residency-cap overflow shows an opaque
-            // planet rather than a hole to the sky. Its radius is the
-            // ellipsoid's SEMI-MINOR axis minus 11 km, which clears
-            // Challenger Deep's -10 935 m at every latitude -- the polar
-            // radius is the global minimum of the ellipsoid, so this bound
-            // holds everywhere and not merely at the site.
-            //
-            // It is also always on when terrain is: a hole in the world is
-            // worse than a sphere you never see.
-            ground_body_R = pt::planet::kBackstopRadius;
-            planet_ground_on = true;
-        }
-#endif
-        push.planet_ground[3] =
-            planet_ground_on ? static_cast<float>(ground_body_R) : 0.0f;
-        // --- end Planetary P3 -------------------------------------------
-        // --- Planetary P4 (#258): terrain runtime state -----------------
-        {
-            double snowline = 4900.0;
-            if (auto* v = C.FindCVar("r_planet_snowline")) snowline = v->GetFloat();
-            std::size_t live = 0;
-            bool on = false;
-#if PT_PLANET_ENABLED
-            if (terrain_on) {
-                live = planet_terrain_->Stats().resident;
-                on   = true;
-            }
-#endif
-            // LAND COVER (#300) CHANGES WHAT THIS FIELD MEANS. It used to
-            // be `snowline * cos(site latitude)` -- the site's own latitude,
-            // folded in here on the host, so an entire planet had ONE
-            // snowline and a globe seen from orbit could not have had a
-            // latitude-varying one at all. It now carries the TROPICAL
-            // ANCHOR unscaled, and the shader's ptSnowlineAt() derives the
-            // local value from the SHADED POINT's latitude through the
-            // freezing-level model in src/renderer/Planet/SurfaceAlbedo.h.
-            //
-            // The cvar's docstring did not say "cos", so its name still
-            // describes it; what changed is that the latitude dependence
-            // moved from a shape on the host to a model on the GPU.
-            push.planet_terrain[0] = static_cast<float>(snowline);
-            push.planet_terrain[1] = static_cast<float>(live);
-            push.planet_terrain[2] = on ? 1.0f : 0.0f;
-            push.planet_terrain[3] = 0.0f;
-        }
-        // --- end Planetary P4 -------------------------------------------
-        // --- Land cover (#300): the site's ECEF basis + raster shape -----
-        // Identity when there is no terrain site: with no planet placed,
-        // world space IS the ellipsoid frame as far as anything here is
-        // concerned, and the raster width of 0 gates the shader off anyway.
-        {
-            glm::dmat3 e2w(1.0);
-#if PT_PLANET_ENABLED
-            if (terrain_on) e2w = planet_terrain_->Site().ecef_to_world;
-#endif
-            // Rows are (East, geocentric Up, South) in ECEF. The shader
-            // computes ecef = E*w.x + U*w.y + S*w.z, i.e.
-            // transpose(ecef_to_world) * w -- so what it needs is the rows,
-            // and glm is column-major, so row r is e2w[c][r].
-            for (int r = 0; r < 3; ++r) {
-                float* dst = (r == 0) ? push.land_basis_e
-                           : (r == 1) ? push.land_basis_u
-                                      : push.land_basis_s;
-                for (int c = 0; c < 3; ++c) {
-                    dst[c] = static_cast<float>(e2w[c][r]);
-                }
-            }
-            float land_gain = 1.0f;
-            if (auto* v = C.FindCVar("r_planet_land_albedo")) {
-                land_gain = std::clamp(v->GetFloat(), 0.0f, 1.0f);
-            }
-            const bool raster_ok =
-                land_albedo_buf_id_ != 0 && !land_albedo_map_.Empty();
-            push.land_basis_e[3] =
-                raster_ok ? static_cast<float>(land_albedo_map_.Width()) : 0.0f;
-            push.land_basis_u[3] =
-                raster_ok ? static_cast<float>(land_albedo_map_.Height()) : 0.0f;
-            push.land_basis_s[3] = land_gain;
-        }
-        // --- end land cover ----------------------------------------------
-        // --- Planetary P5 (#259): the planetary ocean -------------------
-        // ONE RADIUS, NOT A SECOND SOURCE OF TRUTH. The sea-level radius
-        // is planet_R_d -- the same scalar that placed planet_center_radius
-        // and, with terrain on, the site's geocentric radius, which is the
-        // radius of the sphere TANGENT TO THE WGS-84 ELLIPSOID at the site.
-        // So near the site "sea level" and "the terrain's zero elevation"
-        // are the same surface and the coastline falls where the DEM's own
-        // sign change is, with nothing to agree about.
-        //
-        // AND WHAT THAT COSTS AWAY FROM THE SITE. The terrain is on the
-        // ellipsoid; this is a sphere tangent to it. The two separate as
-        // (d^2 / 2) * (1/R_sphere - 1/R_curvature), which for the WGS-84
-        // prime-vertical radius at 45 deg (6 388 838 m) against the mean
-        // 6 371 009 m is 4.4e-10 per metre: 5 mm at the 4.7 km horizon from
-        // eye height, 2.2 cm at 10 km, and 2.2 m at 100 km. Against a
-        // pixel footprint of 107 m at 100 km that is 2% of a pixel of
-        // coastline displacement. It is a real approximation and not a
-        // rounding, and closing it needs a stable ray-ELLIPSOID solve --
-        // which P3 (#257) deliberately deferred, for reasons that have not
-        // changed: the obvious scale-to-a-unit-sphere solve reintroduces
-        // exactly the cancellation #254 and #275 removed.
-        {
-            bool ocean_on = false;
-            if (auto* v = C.FindCVar("r_planet_ocean")) ocean_on = v->GetBool();
-            // A planar frame has no centre to put a shell around.
-            ocean_on = ocean_on && spherical_frame;
-
-            // THE ONE CONFIGURATION THAT SILENTLY SHOWS NO OCEAN. Without
-            // terrain, the P3 analytic body sits at planet_R_d -- the SAME
-            // radius as this shell. Both branches solve the same sphere and
-            // return the same t, the shell's `t_w < h.t` is strictly less,
-            // so the ground wins every pixel and the sea is invisible with
-            // nothing in the log to say why. With terrain on there is no
-            // conflict: the body drops to the semi-minor axis minus 11 km
-            // and becomes the streaming backstop it is meant to be.
-            //
-            // A one-shot warning rather than a silent nudge to the body's
-            // radius: moving it would change what every P3 and P6 fixture
-            // renders to fix a scene-authoring mistake.
-            if (ocean_on && planet_ground_on &&
-                ground_body_R == planet_R_d) {
-                static bool s_warned_ocean_ground = false;
-                if (!s_warned_ocean_ground) {
-                    s_warned_ocean_ground = true;
-                    LOG_WARN("engine: r_planet_ocean 1 and r_planet_ground 1 "
-                             "without terrain put a water shell and an opaque "
-                             "body at the SAME radius ({:.1f} m), and the "
-                             "opaque one wins every pixel -- the ocean will "
-                             "not be visible. Set r_planet_ground 0 (the "
-                             "planet IS the ocean) or r_planet_terrain 1 "
-                             "(the body drops to the seabed backstop).",
-                             planet_R_d);
-                }
-            }
-
-            const std::uint32_t cascades =
-                static_cast<std::uint32_t>(ocean_cascades_.size());
-            // Cox & Munk is a pure function of the wind and is read
-            // STRAIGHT FROM THE CVAR here, not from anything the solver
-            // left behind. That placement is the whole A/B: with r_ocean 0
-            // the solver never runs, and if this came out of it the shell
-            // would fall back to a mirror -- which is what the first run of
-            // this code did, and it renders a pinpoint sun reflection where
-            // an ocean from 400 km has a 15-degree glitter patch. The
-            // control has to be the SAME surface with its waves moved into
-            // the BRDF, not a different material.
-            float ocean_wind = 12.0f;
-            if (auto* v = C.FindCVar("r_ocean_wind_speed")) {
-                ocean_wind = v->GetFloat();
-            }
-            ocean_cox_munk_sigma2_ = pt::ocean::CoxMunkMeanSquareSlope(
-                static_cast<double>(ocean_wind));
-            push.planet_ocean[0] =
-                ocean_on ? static_cast<float>(planet_R_d) : 0.0f;
-            push.planet_ocean[1] = static_cast<float>(std::max(cascades, 1u));
-            push.planet_ocean[2] =
-                static_cast<float>(ocean_cox_munk_sigma2_);
-            push.planet_ocean[3] = 0.0f;
-
-            const OceanTangentFrame tf =
-                ComputeOceanTangentFrame(cam.pos_w, planet_R_d);
-            // CONVERSION BOUNDARY (#255): the anchor is a canonical world
-            // position and every shader position is anchor-relative, so it
-            // crosses here and nowhere else. The two basis vectors are
-            // DIRECTIONS and do not rebase.
-            const glm::vec3 o_rel = world_frame_.ToRender(tf.origin_w);
-            push.ocean_tan_e[0] = static_cast<float>(tf.east_w.x);
-            push.ocean_tan_e[1] = static_cast<float>(tf.east_w.y);
-            push.ocean_tan_e[2] = static_cast<float>(tf.east_w.z);
-            push.ocean_tan_e[3] = static_cast<float>(kOceanCascadePeriodM[0]);
-            push.ocean_tan_n[0] = static_cast<float>(tf.north_w.x);
-            push.ocean_tan_n[1] = static_cast<float>(tf.north_w.y);
-            push.ocean_tan_n[2] = static_cast<float>(tf.north_w.z);
-            push.ocean_tan_n[3] = static_cast<float>(kOceanCascadePeriodM[1]);
-            push.ocean_tan_o[0] = o_rel.x;
-            push.ocean_tan_o[1] = o_rel.y;
-            push.ocean_tan_o[2] = o_rel.z;
-            push.ocean_tan_o[3] = static_cast<float>(kOceanCascadePeriodM[2]);
-            push.ocean_phase[0] = static_cast<float>(tf.phase[1][0]);
-            push.ocean_phase[1] = static_cast<float>(tf.phase[1][1]);
-            push.ocean_phase[2] = static_cast<float>(tf.phase[2][0]);
-            push.ocean_phase[3] = static_cast<float>(tf.phase[2][1]);
-            push.ocean_slope[0] = static_cast<float>(ocean_cascade_sigma2_[0]);
-            push.ocean_slope[1] = static_cast<float>(ocean_cascade_sigma2_[1]);
-            push.ocean_slope[2] = static_cast<float>(ocean_cascade_sigma2_[2]);
-            // Clean water has no microsurface roughness of its own -- every
-            // bit of it is wave slope, and the wave slope is accounted for
-            // above. A non-zero value here would be an artistic dial in the
-            // middle of a conservation law.
-            push.ocean_slope[3] = 0.0f;
-        }
-        // --- end Planetary P5 -------------------------------------------
+        // The analytic planet body (#257), streamed terrain (#258), land-
+        // cover raster (#300) and planetary ocean shell (#259) were removed
+        // with the planetary epic. Their push lanes stay in the layout -- the
+        // shader ignores them -- and are held inert so the base path tracer
+        // and the kept procedural/Hosek sky read the pre-planetary geometry.
+        push.planet_ground[0] = 0.0f;  push.planet_ground[1] = 0.0f;
+        push.planet_ground[2] = 0.0f;  push.planet_ground[3] = 0.0f;
+        push.planet_terrain[0] = 0.0f; push.planet_terrain[1] = 0.0f;
+        push.planet_terrain[2] = 0.0f; push.planet_terrain[3] = 0.0f;
+        push.land_basis_e[0] = 1.0f; push.land_basis_e[1] = 0.0f;
+        push.land_basis_e[2] = 0.0f; push.land_basis_e[3] = 0.0f;
+        push.land_basis_u[0] = 0.0f; push.land_basis_u[1] = 1.0f;
+        push.land_basis_u[2] = 0.0f; push.land_basis_u[3] = 0.0f;
+        push.land_basis_s[0] = 0.0f; push.land_basis_s[1] = 0.0f;
+        push.land_basis_s[2] = 1.0f; push.land_basis_s[3] = 1.0f;
+        push.planet_ocean[0] = 0.0f; push.planet_ocean[1] = 1.0f;
+        push.planet_ocean[2] = 0.0f; push.planet_ocean[3] = 0.0f;
+        push.ocean_tan_e[0] = 0.0f; push.ocean_tan_e[1] = 0.0f;
+        push.ocean_tan_e[2] = 0.0f; push.ocean_tan_e[3] = 0.0f;
+        push.ocean_tan_n[0] = 0.0f; push.ocean_tan_n[1] = 0.0f;
+        push.ocean_tan_n[2] = 0.0f; push.ocean_tan_n[3] = 0.0f;
+        push.ocean_tan_o[0] = 0.0f; push.ocean_tan_o[1] = 0.0f;
+        push.ocean_tan_o[2] = 0.0f; push.ocean_tan_o[3] = 0.0f;
+        push.ocean_phase[0] = 0.0f; push.ocean_phase[1] = 0.0f;
+        push.ocean_phase[2] = 0.0f; push.ocean_phase[3] = 0.0f;
+        push.ocean_slope[0] = 0.0f; push.ocean_slope[1] = 0.0f;
+        push.ocean_slope[2] = 0.0f; push.ocean_slope[3] = 0.0f;
 
         // up_xyz.w carries sin(solar elevation) AT THE CAMERA, i.e.
         // dot(localUp(camera), sun_dir). The screen-space sky passes
@@ -10914,45 +9624,9 @@ void Engine::RenderFrame() {
     // the Hosek dome -- env lighting and the visible sky stay consistent.
     else if (sky_mode_str == "hosek")      sky_mode_id = 3;
     // --- end Wave 9 hosek-sky ---
-    // --- Planetary P6 (#260) ---
-    // mode 4 = physical. The sky is integrated along the view ray instead
-    // of painted, which is what makes it survive the camera leaving the
-    // atmosphere. It is a statement about a BODY: without a planet radius
-    // there is no shell to integrate through and no horizon to occlude
-    // the sun, so it falls back to procedural rather than rendering a
-    // black frame. A rename-over-warning would not help here -- the mode
-    // is right, the scene is simply not planetary -- so this logs once
-    // and says which cvar to set.
-    else if (sky_mode_str == "physical") {
-        float pr = 0.0f;
-        if (auto* v = C.FindCVar("r_planet_radius")) pr = v->GetFloat();
-        if (pr > 0.0f) {
-            sky_mode_id = 4;
-        } else {
-            sky_mode_id = 2;
-            static bool warned_physical_no_body = false;
-            if (!warned_physical_no_body) {
-                warned_physical_no_body = true;
-                LOG_WARN("r_sky_mode physical needs a planet: "
-                         "r_planet_radius is 0, so there is no atmosphere "
-                         "shell to integrate. Falling back to procedural.");
-            }
-        }
-    }
-    // --- end Planetary P6 ---
     else /* procedural (default) */        sky_mode_id = 2;
     push.sun_and_mode[3] = float(sky_mode_id);
     push.env_map_present = (sky_mode_id == 1u) ? 1u : 0u;
-    // The physical sky and a tuned sun curve cannot coexist: skyPhysical
-    // lights every march sample with sunSlantTransmittance, so if the
-    // NEE site and the cloud march were still using
-    // exp(-0.30 / max(sun_elev, 0.04)) the air and the ground would
-    // disagree about what colour the sunlight is, and the sun would keep
-    // lighting the night side because that curve has no notion of a body
-    // in the way. Mode 4 therefore implies r_sun_physical_transmittance
-    // rather than leaving the pair to be set consistently by hand.
-    // Modes 0-3 keep the cvar's own value, so P3's A/B is untouched.
-    if (sky_mode_id == 4u) push.sun_extra2[1] = 1.0f;
     // --- Wave 9 hosek-sky ---
     // Fill the Hosek-Wilkie parameters. Read by the shader only in mode
     // 3, but always populated (cheap) so a mid-render r_sky_mode switch
@@ -11719,38 +10393,6 @@ void Engine::RenderFrame() {
                 double(n.x) * cam.pos_w.x + double(n.y) * cam.pos_w.y +
                 double(n.z) * cam.pos_w.z + d;
             if (signed_dist <= 0.0) { cam_in_water = true; break; }
-        }
-        // --- Planetary P5 (#259): the shell has no plane to scan ----------
-        // With a planetary ocean the same question -- "is the eye inside a
-        // MAT_WATER body" -- is a geodetic altitude test rather than a
-        // half-space test against a list of planes. Same one-line output.
-        //
-        // Evaluated in f64 against the canonical camera position, for the
-        // same reason the plane scan above is: at ECEF altitude both
-        // |cam - centre| and the radius are ~6.4e6 and their difference is
-        // metres, so a float32 form would be a textbook cancellation
-        // deciding a boolean.
-        if (!cam_in_water) {
-            bool planet_ocean_on = false;
-            if (auto* v = C.FindCVar("r_planet_ocean")) {
-                planet_ocean_on = v->GetBool();
-            }
-            bool spherical = false;
-            if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
-                spherical = v->GetBool();
-            }
-            double R = 0.0;
-            if (auto* v = C.FindCVar("r_planet_radius")) R = v->GetFloat();
-#if PT_PLANET_ENABLED
-            if (planet_terrain_ && planet_terrain_->Ready()) {
-                spherical = true;
-                R = planet_terrain_->Site().site_radius_m;
-            }
-#endif
-            if (planet_ocean_on && spherical && R > 0.0) {
-                const glm::dvec3 centre(0.0, -R, 0.0);
-                if (glm::length(cam.pos_w - centre) < R) cam_in_water = true;
-            }
         }
         float deep_r = 0.0f, deep_g = 0.0f, deep_b = 0.0f;
         if (auto* v = C.FindCVar("r_water_deep_color_r")) deep_r = v->GetFloat();
@@ -15011,29 +13653,6 @@ void Engine::UpdateCamera(double dt) {
     float sprint  = 3.0f;
     if (auto* v = C.FindCVar("cam_speed"))       speed  = v->GetFloat();
     if (auto* v = C.FindCVar("cam_sprint_mult")) sprint = v->GetFloat();
-#if PT_PLANET_ENABLED
-    // --- Planetary P4 (#258): altitude-scaled camera speed ---------------
-    // cam_speed's 3 m/s default is a walking pace, and you cannot reach
-    // orbit at a walking pace: 400 km at 3 m/s is a day and a half. Scale
-    // it with altitude above the terrain so ONE control works from a 1.7 m
-    // eye height to a 400 km orbit, which is what "one continuous camera
-    // path from the surface to orbit" needs.
-    //
-    // altitude / 4 m/s holds the horizon's angular rate roughly constant:
-    // the visible horizon distance goes as sqrt(2*R*h), so moving at h/4
-    // per second sweeps a fixed fraction of it per second at every scale.
-    // Never SLOWER than cam_speed, so standing on the ground behaves
-    // exactly as before.
-    if (planet_terrain_ && planet_terrain_->Ready() && camera_) {
-        bool scale_on = true;
-        if (auto* v = C.FindCVar("r_planet_cam_speed_scale")) scale_on = v->GetBool();
-        if (scale_on) {
-            const double alt = TerrainAltitude(camera_->pos_w);
-            speed = std::max(speed, static_cast<float>(std::max(alt, 0.0) * 0.25));
-        }
-    }
-    // --- end Planetary P4 -------------------------------------------------
-#endif
 
     bool shift = window_->IsKeyDown(340) || window_->IsKeyDown(344);  // L/R Shift
 
@@ -15682,16 +14301,8 @@ void Engine::Tick(double dt) {
     // Freeze them during loading frames in smoke mode; interactive
     // runs are unaffected. This closes the residual nondeterminism
     // hole left after the dt pin (5d57b29).
-    //
-    // Planetary P4 (#258) adds a second reason to hold: terrain chunks are
-    // baked ASYNCHRONOUSLY, so the residency set at frame N is a function
-    // of wall clock until the selector converges. `planet_settling_` is the
-    // same idea as a loading frame -- do not advance the world and do not
-    // count the frame -- applied to geometry that streams rather than to a
-    // pipeline that compiles. Without it, "golden determinism" would be a
-    // hope rather than a property.
     const bool freeze_sims_for_capture =
-        smoke_fixed_dt_active_ && (loading_frame_active_ || planet_settling_);
+        smoke_fixed_dt_active_ && loading_frame_active_;
 
     // Sky animation: advance r_sky_hour by `rate * dt` real-time
     // seconds. Wraps modulo 24. Marks accumulation dirty so the path
@@ -16099,7 +14710,7 @@ void Engine::Run() {
         }
 
         if (smoke_frame_budget > 0) {
-            if (device_ && !loading_frame_active_ && !planet_settling_) {
+            if (device_ && !loading_frame_active_) {
                 ++smoke_frames_rendered;
                 if (smoke_frames_rendered >= smoke_frame_budget) {
                     LOG_INFO("smoke-test: rendered {} frame(s); "
@@ -18297,13 +16908,11 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
-    // The planet body changes what rays hit, so a mid-run toggle must not
-    // blend new samples into a mean taken against the old geometry.
-    for (const char* n : {"r_planet_ground", "r_planet_ground_albedo",
-                          "r_sun_physical_transmittance"}) {
-        if (auto* v = C.FindCVar(n)) {
-            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
-        }
+    // Physical sun transmittance changes the colour of the sunlight the
+    // accumulator's existing samples were lit by, so a mid-run toggle must
+    // reset rather than blend two different suns together.
+    if (auto* v = C.FindCVar("r_sun_physical_transmittance")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // r_ozone joins this list for the same reason the others are on it:
     // it changes the medium the accumulator's existing samples were drawn
@@ -18675,8 +17284,7 @@ void Engine::RegisterCommands() {
     }
     // Sky cvars: changing any of them invalidates accumulation.
     if (auto* v = C.FindCVar("r_sky_mode")) {
-        v->allowed_values = {"gradient", "hdri", "procedural", "hosek",
-                             "physical"};
+        v->allowed_values = {"gradient", "hdri", "procedural", "hosek"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_sun_elevation")) {
@@ -19277,14 +17885,12 @@ void Engine::RegisterCommands() {
         const char* hint;
     };
     // True for sky modes that consume the manual sun-position cvars:
-    // procedural, hosek (Wave 9) and physical (planetary P6, #260). All
-    // three derive the sun direction from r_sun_elevation /
-    // r_sun_azimuth (or the astronomical override), so those cvars are
-    // NOT inert in any of them.
+    // procedural and hosek (Wave 9). Both derive the sun direction from
+    // r_sun_elevation / r_sun_azimuth (or the astronomical override), so
+    // those cvars are NOT inert in either.
     auto sky_proc = []() {
         auto* m = pt::console::Console::Get().FindCVar("r_sky_mode");
-        return m != nullptr && (m->value == "procedural" || m->value == "hosek"
-                             || m->value == "physical");
+        return m != nullptr && (m->value == "procedural" || m->value == "hosek");
     };
     auto clouds_on = []() {
         auto* c = pt::console::Console::Get().FindCVar("r_clouds");
@@ -19761,76 +18367,6 @@ void Engine::RegisterCsgCommands() {
                            mesh_prev_translation_[0], mesh_prev_translation_[1], mesh_prev_translation_[2],
                            mesh_curr_translation_[0], mesh_curr_translation_[1], mesh_curr_translation_[2]);
         });
-    // --- Planetary P4 (#258) ---------------------------------------------
-    C.RegisterCommand("planet_stand",
-        "planet_stand [eye_height_m]: move the camera to the terrain "
-        "surface directly below it, at the given eye height (default 1.7 "
-        "m). Necessary because the engine's y = 0 is the ellipsoid at the "
-        "reference site, not the ground: with the real ETOPO grid the site "
-        "is Everest's summit at 8 849 m.",
-        [this](std::span<const std::string_view> args, pt::console::Output& out) {
-#if PT_PLANET_ENABLED
-            double eye = 1.7;
-            if (args.size() >= 2) {
-                eye = std::strtod(std::string(args[1]).c_str(), nullptr);
-            }
-            if (!planet_terrain_ || !planet_terrain_->Ready() || !camera_) {
-                out.FormatLine("planet_stand: terrain is not active");
-                return;
-            }
-            camera_->pos_w = planet_terrain_->SurfacePosition(camera_->pos_w, eye);
-            accum_dirty_ = true;
-            out.FormatLine("planet_stand: camera at ({:.3f} {:.3f} {:.3f}), "
-                           "{:.2f} m above the terrain",
-                           camera_->pos_w.x, camera_->pos_w.y, camera_->pos_w.z,
-                           TerrainAltitude(camera_->pos_w));
-#else
-            (void)args;
-            out.FormatLine("planet_stand: this build has PT_PLANET_ENABLED=OFF");
-#endif
-        });
-    C.RegisterCommand("planet_stats",
-        "planet_stats: terrain residency, streaming and acceleration-"
-        "structure counters. The stall count is the instrument P0 (#254) "
-        "added for exactly this claim -- a paced TLAS republish must move "
-        "it by zero, while a chunk BLAS build moves it by one because "
-        "Device::CreateBLAS still blocks by design.",
-        [this](auto, pt::console::Output& out) {
-#if PT_PLANET_ENABLED
-            if (!planet_terrain_ || !planet_terrain_->Ready()) {
-                out.FormatLine("planet_stats: terrain off (r_planet_terrain=0 "
-                               "or no hardware ray tracing on this backend)");
-                return;
-            }
-            const auto& st = planet_terrain_->Stats();
-            out.FormatLine("planet_stats: resident={} desired={} pending={} "
-                           "converged={}",
-                           st.resident, st.desired, st.pending_bakes,
-                           st.converged ? 1 : 0);
-            out.FormatLine("planet_stats: blas_builds={} tlas_updates={} "
-                           "evictions={} last_build_ms={:.3f}",
-                           st.blas_builds, st.tlas_updates, st.evictions,
-                           st.last_build_ms);
-            out.FormatLine("planet_stats: accel_gpu_stalls={} "
-                           "stalls_added_by_last_publish={}",
-                           device_ ? device_->AccelGpuStallCount()
-                                   : static_cast<std::uint64_t>(0),
-                           planet_stall_baseline_);
-            out.FormatLine("planet_stats: dem={} site={:.4f},{:.4f} "
-                           "tlas_capacity={}",
-                           planet_terrain_->HasDem() ? "real" : "procedural",
-                           planet_terrain_->Site().lat_rad * 57.29577951308232,
-                           planet_terrain_->Site().lon_rad * 57.29577951308232,
-                           planet_terrain_->TlasCapacity());
-            if (camera_) {
-                out.FormatLine("planet_stats: camera_altitude={:.3f} m",
-                               TerrainAltitude(camera_->pos_w));
-            }
-#else
-            out.FormatLine("planet_stats: this build has PT_PLANET_ENABLED=OFF");
-#endif
-        });
-    // --- end Planetary P4 -------------------------------------------------
 }
 
 namespace {
@@ -23107,42 +21643,9 @@ void Engine::StepPhysics(float dt) {
     if (clamped_dt > kMaxStepSec) clamped_dt = kMaxStepSec;
     if (clamped_dt <= 0.0f)        return;
 
-    // --- Planetary P4 (#258): radial gravity -----------------------------
-    // With a planet under the scene, "down" is toward its centre, not
-    // world -Y. Off the reference site the two differ by the geocentric
-    // angle, which at 100 km of ground track is already 0.9 degrees -- a
-    // dropped body would visibly fall sideways.
-    //
-    // mu is WGS-84's GM = 3.986004418e14 m^3/s^2 (NIMA TR8350.2). Note it
-    // gives 9.820 m/s^2 at the mean radius rather than phys_gravity_y's
-    // 9.81: the familiar figure is the SURFACE value at ~45 deg latitude
-    // and carries the centrifugal term of Earth's rotation plus the
-    // ellipsoid's flattening, neither of which is modelled. 0.2%.
-    //
-    // GROUND CONTACT IS STILL THE y = 0 PLANE. That is a real remainder,
-    // and it is bounded rather than hidden: y = 0 is the tangent plane at
-    // the reference site, and the ellipsoid falls away from it by
-    // d^2 / 2R -- 1.6 cm at 450 m of ground track, 7.8 m at 10 km. So
-    // bodies dropped near the site rest correctly and bodies dropped a
-    // kilometre away float. Geodetic contact against the streamed
-    // heightfield needs a height oracle inside the 480-substep-per-second
-    // inner loop AND an answer for a body standing over a chunk that is
-    // not resident; both are out of this phase's scope.
+    // Gravity is uniform world -Y for the game-like scene.
     pt::physics::PhysicsSystem::GravityField gfield{};
     gfield.planar = glm::vec3(0.0f, gy, 0.0f);
-#if PT_PLANET_ENABLED
-    if (planet_terrain_ && planet_terrain_->Ready()) {
-        gfield.radial = true;
-        // CANONICAL, not render-frame. PhysicsSystem stores positions as
-        // float32 in the CANONICAL frame (they round-trip through
-        // AnalyticPrim::pos_or_n, which is f64 canonical), and bodies live
-        // near the world origin where that is exact. Converting the centre
-        // through world_frame_.ToRender() would put the two operands of
-        // `p - centre` in different frames the moment the anchor engaged.
-        gfield.centre = glm::vec3(planet_terrain_->Site().CenterWorld());
-        gfield.mu     = static_cast<float>(pt::planet::kWgs84Mu);
-    }
-#endif
     physics_->Step(clamped_dt, substeps, gfield, damp);
 
     // --- Issue #181 velocity-magnitude debug viz --------------------
@@ -24912,511 +23415,10 @@ void Engine::StepOcean(float dt) {
     // (within FP tolerance) state.
     ocean_time_ += static_cast<double>(dt);
 
-    // --- Planetary P5 (#259): cascades instead of one tile -----------------
-    // With r_planet_ocean on the ocean is a shell, not a plane, and one
-    // 50 m tile over 361 million square kilometres is a visible grid. The
-    // cascade solvers replace the single tile entirely (they write the same
-    // two textures, stacked) rather than running alongside it.
-    bool planetary_ocean = false;
-    if (auto* v = C.FindCVar("r_planet_ocean")) planetary_ocean = v->GetBool();
-    if (planetary_ocean) {
-        bool spherical = false;
-        if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
-            spherical = v->GetBool();
-        }
-#if PT_PLANET_ENABLED
-        // Terrain streaming implies the spherical frame -- see the push
-        // fill, where the same implication is enforced.
-        if (planet_terrain_ && planet_terrain_->Ready()) spherical = true;
-#endif
-        float radius = 0.0f;
-        if (auto* v = C.FindCVar("r_planet_radius")) radius = v->GetFloat();
-        planetary_ocean = spherical && radius > 0.0f;
-    }
-    if (planetary_ocean) {
-        StepOceanCascades(ocean_time_, cfg.grid_size);
-    } else {
-        ocean_cascades_.clear();
-        ocean_cascade_sigma2_[0] = 0.0;
-        ocean_cascade_sigma2_[1] = 0.0;
-        ocean_cascade_sigma2_[2] = 0.0;
-        // The legacy single-tile MAT_WATER ocean is CPU-solved, full stop.
-        // r_ocean_gpu is about the planetary cascades: the flat-plane path
-        // has one tile, no atlas and no metadata row, and moving it would
-        // regenerate ocean_fft / ocean_foam / water_pool for no gain.
-        ocean_gpu_owns_field_ = false;
-        ocean_gpu_pending_    = false;
-        ocean_gpu_last_t_     = -1.0;
-        ocean_->Update(ocean_time_);
-        ocean_max_disp_y_ = ocean_->MaxDisplacementY();
-    }
+    // The single-tile MAT_WATER ocean is CPU-solved, full stop.
+    ocean_->Update(ocean_time_);
+    ocean_max_disp_y_ = ocean_->MaxDisplacementY();
     EnsureOceanUploaded();
-}
-
-// --- Planetary P5 (#259): where the tangent frame is PLACED ---------------
-//
-// The lattice mathematics is pt::ocean::OceanTangentAnchor -- a free
-// function over glm, so tests/pt_ocean_fft_test.cpp exercises the real code
-// rather than a transcription of it. What lives here is the part that is
-// about this engine: which triad the lattice is measured against, and where
-// the canonical-to-render conversion boundary is.
-Engine::OceanTangentFrame Engine::ComputeOceanTangentFrame(
-    const glm::dvec3& cam_w, double sea_radius_m) const {
-    OceanTangentFrame f;
-    if (!(sea_radius_m > 0.0)) return f;
-
-    // The reference triad. With terrain the ellipsoid's own ECEF frame is
-    // available, so the lattice's latitude and longitude are the real ones
-    // and the wave field is geographically stable; without it any fixed
-    // orthonormal triad does, and the identity one is the obvious choice --
-    // it puts the pole on world +Z, orthogonal to the local vertical at the
-    // world origin, so the frame is non-degenerate where scenes are.
-    glm::dmat3 e2w(1.0);
-#if PT_PLANET_ENABLED
-    if (planet_terrain_ && planet_terrain_->Ready()) {
-        e2w = planet_terrain_->Site().ecef_to_world;
-    }
-#endif
-    const glm::dvec3 pole  = glm::normalize(e2w * glm::dvec3(0.0, 0.0, 1.0));
-    const glm::dvec3 prime = glm::normalize(e2w * glm::dvec3(1.0, 0.0, 0.0));
-    const glm::dvec3 centre(0.0, -sea_radius_m, 0.0);
-
-    const pt::ocean::OceanTangentFrame t = pt::ocean::OceanTangentAnchor(
-        cam_w - centre, sea_radius_m, pole, prime, kOceanCascadePeriodM,
-        kOceanCascades);
-    if (!t.valid) return f;
-    f.valid    = true;
-    f.origin_w = centre + t.origin;
-    f.east_w   = t.east;
-    f.north_w  = t.north;
-    for (int c = 0; c < kOceanCascades; ++c) {
-        f.phase[c][0] = t.phase[c][0];
-        f.phase[c][1] = t.phase[c][1];
-    }
-    return f;
-}
-
-// --- Planetary P5 (#259): the cascade solvers -----------------------------
-//
-// Three independent band-limited Phillips solvers whose summed field is one
-// spectrum, not three copies of it. Every parameter except the tile size,
-// the spectral window and the PRNG seed is shared with the legacy solver, so
-// wind / amplitude / choppiness / foam still mean exactly what their cvars
-// say.
-//
-// WHY EACH CASCADE NEEDS ITS OWN SEED. The Gaussian H0 amplitudes are drawn
-// from the seed; three solvers sharing one seed would draw the SAME sequence
-// and, because the bands are disjoint, the correlation would not cancel --
-// the three fields would share a phase structure and the sum would show it as
-// a repeating envelope. Offsetting by a large prime per cascade makes them
-// independent realisations of the same sea.
-void Engine::StepOceanCascades(double t_seconds, std::uint32_t grid) {
-    if (!ocean_) return;
-    if (ocean_cascades_.size() != static_cast<std::size_t>(kOceanCascades)) {
-        ocean_cascades_.clear();
-        for (int c = 0; c < kOceanCascades; ++c) {
-            ocean_cascades_.emplace_back(
-                std::make_unique<pt::ocean::OceanFFT>());
-        }
-    }
-    const pt::ocean::OceanFFT::Config base = ocean_->GetConfig();
-    for (int c = 0; c < kOceanCascades; ++c) {
-        auto& cfg = ocean_cascades_[static_cast<std::size_t>(c)]->MutableConfig();
-        cfg = base;
-        cfg.grid_size    = grid;
-        cfg.patch_size_m = static_cast<float>(kOceanCascadePeriodM[c]);
-        cfg.band_hi_m    = static_cast<float>(OceanBandHiM(c));
-        cfg.band_lo_m    = static_cast<float>(OceanBandLoM(c, grid));
-        // Cascade 0 is unbounded above; see OceanBandHiM's note.
-        if (c == 0) cfg.band_hi_m = 0.0f;
-        cfg.seed         = base.seed + 7919u * static_cast<std::uint32_t>(c);
-    }
-
-    // --- THE AMPLITUDE IS A MEASUREMENT, NOT A DIAL ------------------------
-    //
-    // r_ocean_amplitude does not survive contact with three tile sizes, and
-    // that is not a scaling inconvenience -- it is a latent bug the cascades
-    // exposed. Tessendorf's H0 should be sqrt(S(k) * dkx * dky), and this
-    // solver omits the k-space cell area (2*pi/L)^2, so the synthesised
-    // height scales with the tile size: the same r_ocean_amplitude that
-    // gives +/-1.5 m crests at L = 50 m gives 383 m crests at L = 1793 m,
-    // measured. (The legacy single-tile path keeps the historic expression
-    // and its one tile size, so nothing that exists today moves.)
-    //
-    // The fix here is not to put the missing factor back and re-tune a
-    // dimensionless dial. It is to delete the dial: the amplitude follows
-    // from the wind through a measured constant, exactly as the sky's Hosek
-    // coefficients stopped being fabricated in b2111dd.
-    //
-    //   * Cox & Munk give the whole sea's mean-square slope at this wind.
-    //   * The Phillips equilibrium range makes slope variance uniform in log
-    //     wavelength, so the share of it the cascade set's window
-    //     [2 * finest spacing, coarsest period] holds is a ratio of logs.
-    //   * Scaling the spectrum by A scales sigma^2 by A exactly (H0 goes as
-    //     sqrt(A)), so ONE evaluation of the un-normalised spectrum solves
-    //     for the amplitude in closed form. No iteration, no search.
-    //
-    // Whatever is left of Cox & Munk's constant after that -- the band below
-    // the finest grid spacing, i.e. the short gravity and capillary ripples
-    // -- is precisely what oceanBrdfAlpha2 puts into the BRDF at ZERO cone
-    // width. The two halves are complementary by construction rather than by
-    // agreement, and that is the whole handover.
-    // ...AND IT IS SOLVED ONCE PER SPECTRUM, NOT ONCE PER FRAME. The answer
-    // depends on {grid, wind, wind direction, gravity, seed} and on nothing
-    // else -- every other input to a cascade's spectrum (its tile period,
-    // its band edges) is derived from the grid through the partition above.
-    // Re-deriving it every frame meant SIX seeded mt19937 sweeps over grid^2
-    // cells per frame (one at A = 1 and one at the solved A, per cascade)
-    // for a number that cannot have moved. The cache is bit-exact rather
-    // than approximately equal, because H0 is a deterministic function of
-    // the config: the spectrum the cache leaves in place IS the spectrum the
-    // rebuild would have produced, from the same seed, in the same order.
-    const OceanAmpKey key{grid, base.wind_speed, base.wind_dir_rad,
-                          base.gravity, base.seed};
-    if (!ocean_amp_valid_ || !(key == ocean_amp_key_)) {
-        const double lambda_bot = OceanBandLoM(kOceanCascades - 1, grid);
-        const double lambda_top = kOceanCascadePeriodM[0];
-        const double resolved_fraction = pt::ocean::SlopeVarianceFractionInBand(
-            lambda_bot, lambda_top, static_cast<double>(base.wind_speed));
-        const double target_sigma2 =
-            pt::ocean::CoxMunkMeanSquareSlope(
-                static_cast<double>(base.wind_speed)) * resolved_fraction;
-        double raw_sigma2 = 0.0;
-        for (int c = 0; c < kOceanCascades; ++c) {
-            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
-            s->MutableConfig().amplitude = 1.0f;
-            s->EnsureSpectrum();
-            raw_sigma2 += s->SlopeVarianceAbove(0.0);
-        }
-        ocean_amp_ = (raw_sigma2 > 0.0)
-                         ? static_cast<float>(target_sigma2 / raw_sigma2)
-                         : 0.0f;
-        for (int c = 0; c < kOceanCascades; ++c) {
-            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
-            s->MutableConfig().amplitude = ocean_amp_;
-            s->EnsureSpectrum();
-            ocean_amp_sigma2_[c] = s->SlopeVarianceAbove(0.0);
-        }
-        ocean_amp_key_   = key;
-        ocean_amp_valid_ = true;
-    } else {
-        // Belt and braces: the amplitude is cached, but EnsureSpectrum is
-        // still called so a config field the key does not carry cannot
-        // leave a stale spectrum behind. It is a comparison, not a rebuild,
-        // whenever the key really was complete.
-        for (int c = 0; c < kOceanCascades; ++c) {
-            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
-            s->MutableConfig().amplitude = ocean_amp_;
-            s->EnsureSpectrum();
-        }
-    }
-    for (int c = 0; c < kOceanCascades; ++c) {
-        ocean_cascade_sigma2_[c] = ocean_amp_sigma2_[c];
-    }
-    // --- WHO RUNS THE PER-FRAME WORK ---------------------------------------
-    // Everything above is the spectrum, and the spectrum is the host's.
-    // What follows -- the time evolution, the five spectra per cascade, the
-    // fifteen inverse FFTs, the pack, the normals and the foam -- is the
-    // 15.6 ms, and it goes to the GPU when there is a GPU that can take it.
-    const bool gpu = OceanGpuAvailable() &&
-                     EnsureOceanGpuResources(grid,
-                         static_cast<std::uint32_t>(kOceanCascades));
-    double max_h = 0.0;
-    if (gpu) {
-        UploadOceanGpuSpectrum(grid,
-                               static_cast<std::uint32_t>(kOceanCascades));
-        // The two scalars the foam model needs that are transcendental
-        // functions of frame state rather than of the field. Evaluating
-        // them here rather than in the kernel keeps std::pow and the
-        // smoothstep out of the CPU-vs-GPU difference entirely, so the
-        // measured disagreement is the FFT's and only the FFT's.
-        float dt = (ocean_gpu_last_t_ >= 0.0)
-                       ? static_cast<float>(t_seconds - ocean_gpu_last_t_)
-                       : 0.0f;
-        if (dt < 0.0f) dt = 0.0f;
-        ocean_gpu_last_t_ = t_seconds;
-        const float persistence = std::clamp(base.foam_persistence, 0.0f, 0.999f);
-        ocean_gpu_decay_ = (persistence > 0.0f)
-                               ? std::pow(persistence, dt * 60.0f)
-                               : 0.0f;
-        constexpr float kWhitecapOnsetMps = 7.0f;
-        constexpr float kWhitecapWidthMps = 5.0f;
-        float wind_cov = (base.wind_speed -
-                          (kWhitecapOnsetMps - kWhitecapWidthMps)) /
-                         (2.0f * kWhitecapWidthMps);
-        wind_cov = std::clamp(wind_cov, 0.0f, 1.0f);
-        wind_cov = wind_cov * wind_cov * (3.0f - 2.0f * wind_cov);
-        wind_cov *= std::max(base.foam_coverage, 0.0f);
-        ocean_gpu_wind_cov_ = std::clamp(wind_cov, 0.0f, 1.0f);
-
-        ocean_gpu_t_        = t_seconds;
-        ocean_gpu_lambda_   = std::max(base.choppiness, 0.0f);
-        ocean_gpu_foam_thr_ = base.foam_threshold;
-        ocean_gpu_foam_amt_ = std::max(base.foam_amount, 0.0f);
-        ocean_gpu_gravity_  = base.gravity;
-        ocean_gpu_pending_    = true;
-        ocean_gpu_owns_field_ = true;
-        // ocean_max_disp_y_ is deliberately NOT set here. On this path the
-        // peak crest only exists after the reduce pass has run, and it
-        // reaches the shader through the atlas metadata row instead of
-        // through ocean_params0.w -- see DispatchOceanCascades. The stale
-        // ocean_params0.w that leaves behind is unreachable: it feeds only
-        // oceanRayMarch, the FLAT-plane march, and PathTrace takes that
-        // branch only when planet_ocean.x == 0, which is exactly when this
-        // code did not run.
-    } else {
-        ocean_gpu_owns_field_ = false;
-        ocean_gpu_pending_    = false;
-        // A later switch back to the GPU solver must re-seed its dt the way
-        // a first frame does, or the foam trail would decay by however long
-        // the CPU path ran. (Flipping r_ocean_gpu at runtime does leave one
-        // transient either way: whichever solver was idle has a stale
-        // last-frame time and a stale foam accumulator, so the whitecap
-        // trail restarts. It is a debug switch, the transient is one frame,
-        // and the alternative is keeping both solvers warm -- which is the
-        // 15.6 ms this phase exists to stop paying.)
-        ocean_gpu_last_t_     = -1.0;
-        for (int c = 0; c < kOceanCascades; ++c) {
-            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
-            s->Update(t_seconds);
-            max_h += static_cast<double>(s->MaxDisplacementY());
-        }
-        // The band the ray-march brackets has to clear the SUM of the
-        // cascades' crests, not any one of them -- they are independent
-        // fields and their peaks can coincide.
-        ocean_max_disp_y_ = static_cast<float>(max_h);
-    }
-
-    // THE SLOPE BUDGET, reported rather than assumed. The handover splits a
-    // measured constant between geometry and BRDF, so the one thing worth
-    // saying out loud is how much of it the synthesised sea actually took:
-    //   geometry <= Cox-Munk  ->  the BRDF carries the sub-grid remainder,
-    //                             which is the capillary band and is real;
-    //   geometry >  Cox-Munk  ->  r_ocean_amplitude has been dialled past
-    //                             the sea Cox & Munk photographed, the
-    //                             remainder clamps to zero, and the near
-    //                             field is steeper than the far field
-    //                             converges to. Not an error -- an
-    //                             amplitude choice -- but it should not be
-    //                             silent.
-    if (base.wind_speed != ocean_logged_wind_) {
-        ocean_logged_wind_ = base.wind_speed;
-        const double cm = pt::ocean::CoxMunkMeanSquareSlope(
-            static_cast<double>(base.wind_speed));
-        const double geom = ocean_cascade_sigma2_[0] + ocean_cascade_sigma2_[1] +
-                            ocean_cascade_sigma2_[2];
-        // The peak crest is a property of the FRAME, not of the spectrum,
-        // and on the GPU path it never comes back to the host at all -- it
-        // is reduced on the GPU and travels to the shader in the atlas's
-        // metadata row. Reporting it as "gpu" rather than as a stale or
-        // zeroed float is the honest form: this line is the SPECTRUM's
-        // budget and the rest of it is unchanged either way.
-        const std::string peak =
-            gpu ? std::string("gpu-resident")
-                : fmt::format("{:.2f} m", max_h);
-        LOG_INFO("ocean: cascades {:.0f}/{:.0f}/{:.0f} m, peak |h| {}, "
-                 "mean-square slope {:.5f}/{:.5f}/{:.5f} = {:.5f} geometry "
-                 "vs Cox-Munk {:.5f} at {:.1f} m/s ({:.0f}% resolved; "
-                 "far-field roughness {:.4f}, solver {})",
-                 kOceanCascadePeriodM[0], kOceanCascadePeriodM[1],
-                 kOceanCascadePeriodM[2], peak,
-                 ocean_cascade_sigma2_[0], ocean_cascade_sigma2_[1],
-                 ocean_cascade_sigma2_[2], geom, cm, base.wind_speed,
-                 (cm > 0.0 ? 100.0 * std::min(geom / cm, 1.0) : 0.0),
-                 pt::ocean::CoxMunkRoughness(
-                     static_cast<double>(base.wind_speed)),
-                 gpu ? "gpu" : "cpu");
-    }
-}
-
-// --- #259 / #133 Phase 2: the compute pre-pass driver ----------------------
-
-bool Engine::OceanGpuAvailable() const {
-    if (ocean_gpu_pipeline_id_ == 0) return false;
-    // SoftwareDevice::CreateComputePipeline hands back a non-zero id for
-    // ANY kernel name -- it is a bookkeeping stub, not a claim that the
-    // kernel exists -- so the pipeline id alone would silently disable the
-    // ocean on the software backend rather than falling back to the CPU
-    // solver. Vulkan builds the SPIR-V but registers no pipeline (its
-    // shared descriptor-set layout does not declare bindings 40..45), so
-    // its id is 0 and it takes the CPU path through the test above; the
-    // backend test here is what makes Software's stub honest.
-    if (current_backend_ != BackendType::Metal) return false;
-    auto& C = pt::console::Console::Get();
-    if (auto* v = C.FindCVar("r_ocean_gpu")) {
-        if (v->GetInt() == 0) return false;
-    }
-    return true;
-}
-
-bool Engine::EnsureOceanGpuResources(std::uint32_t grid,
-                                     std::uint32_t cascades) {
-    if (!device_ || grid == 0u || cascades == 0u) return false;
-    if (ocean_gpu_buf_grid_ == grid && ocean_gpu_buf_cascades_ == cascades &&
-        ocean_gpu_h0_buf_id_ != 0 && ocean_gpu_scratch_buf_id_ != 0 &&
-        ocean_gpu_foam_buf_id_ != 0 && ocean_gpu_reduce_buf_id_ != 0) {
-        return true;
-    }
-
-    auto drop = [&](std::uint64_t& id) {
-        if (id != 0) {
-            device_->DestroyBuffer(pt::rhi::BufferHandle{id});
-            id = 0;
-        }
-    };
-    drop(ocean_gpu_h0_buf_id_);
-    drop(ocean_gpu_scratch_buf_id_);
-    drop(ocean_gpu_foam_buf_id_);
-    drop(ocean_gpu_reduce_buf_id_);
-
-    const std::size_t cells = static_cast<std::size_t>(grid) * grid * cascades;
-    // H0 packs both halves of the static spectrum per cell:
-    // .xy = H0(k), .zw = conj(H0(-k)). 3.0 MiB at grid 256 / 3 cascades,
-    // 12.0 MiB at 512, written only when a spectrum is rebuilt.
-    const std::size_t h0_bytes      = cells * 4u * sizeof(float);
-    // Complex scratch for the five spectra between the row and column
-    // passes: 7.5 MiB at grid 256, 30.0 MiB at 512.
-    const std::size_t scratch_bytes =
-        cells * pt::ocean::kGpuFields * 2u * sizeof(float);
-    const std::size_t foam_bytes    = cells * sizeof(float);
-    // Per-threadgroup peak |height| from the pack pass, then the
-    // per-cascade peak the reduce pass appends.
-    const std::size_t tiles_x       = (grid + 7u) / 8u;
-    const std::size_t reduce_bytes  =
-        (tiles_x * tiles_x * cascades + cascades) * sizeof(float);
-
-    auto make = [&](std::size_t bytes, const char* name) -> std::uint64_t {
-        auto h = device_->CreateBuffer({
-            .size = bytes,
-            .usage = pt::rhi::BufferUsage::Storage,
-            .debug_name = name,
-        });
-        return h.id;
-    };
-    ocean_gpu_h0_buf_id_      = make(h0_bytes,      "ocean_h0");
-    ocean_gpu_scratch_buf_id_ = make(scratch_bytes, "ocean_fft_scratch");
-    ocean_gpu_foam_buf_id_    = make(foam_bytes,    "ocean_foam_accum");
-    ocean_gpu_reduce_buf_id_  = make(reduce_bytes,  "ocean_reduce");
-    if (ocean_gpu_h0_buf_id_ == 0 || ocean_gpu_scratch_buf_id_ == 0 ||
-        ocean_gpu_foam_buf_id_ == 0 || ocean_gpu_reduce_buf_id_ == 0) {
-        LOG_ERROR("ocean: GPU cascade buffer allocation failed at grid {} x "
-                  "{} cascades -- falling back to the CPU solver", grid,
-                  cascades);
-        drop(ocean_gpu_h0_buf_id_);
-        drop(ocean_gpu_scratch_buf_id_);
-        drop(ocean_gpu_foam_buf_id_);
-        drop(ocean_gpu_reduce_buf_id_);
-        return false;
-    }
-
-    // Zero the foam accumulator explicitly. A fresh MTLBuffer's contents
-    // are unspecified, and the CPU solver's equivalent is an explicit
-    // `foam_accum_.assign(cells, 0.0f)` on a grid-size change -- foam is
-    // the one piece of state that survives a frame, so starting it from
-    // whatever the allocator left there would make the first seconds of a
-    // resized ocean nondeterministic.
-    {
-        std::vector<float> zeros(cells, 0.0f);
-        device_->WriteBuffer(pt::rhi::BufferHandle{ocean_gpu_foam_buf_id_},
-                             zeros.data(), zeros.size() * sizeof(float));
-    }
-    // Force a spectrum re-upload: the buffer that held it is gone.
-    for (int c = 0; c < 3; ++c) ocean_gpu_spectrum_rev_[c] = 0u;
-
-    ocean_gpu_buf_grid_     = grid;
-    ocean_gpu_buf_cascades_ = cascades;
-    LOG_INFO("ocean: GPU cascade solver buffers -- H0 {:.1f} MB, FFT scratch "
-             "{:.1f} MB, foam {:.1f} MB (grid {}, {} cascades)",
-             double(h0_bytes) / 1048576.0, double(scratch_bytes) / 1048576.0,
-             double(foam_bytes) / 1048576.0, grid, cascades);
-    return true;
-}
-
-void Engine::UploadOceanGpuSpectrum(std::uint32_t grid,
-                                    std::uint32_t cascades) {
-    if (!device_ || ocean_gpu_h0_buf_id_ == 0) return;
-    bool any = false;
-    for (std::uint32_t c = 0u; c < cascades; ++c) {
-        if (c >= ocean_cascades_.size()) return;
-        if (ocean_cascades_[c]->SpectrumRevision() !=
-            ocean_gpu_spectrum_rev_[c]) {
-            any = true;
-        }
-    }
-    if (!any) return;
-
-    // One whole-buffer write rather than three offset writes: this runs
-    // only when a spectrum was rebuilt (a wind / grid / tile / amplitude /
-    // seed / band change), which for a running scene is the first frame and
-    // then never.
-    const std::size_t per   = static_cast<std::size_t>(grid) * grid;
-    const std::size_t total = per * cascades * 4u;
-    ocean_gpu_h0_staging_.assign(total, 0.0f);
-    for (std::uint32_t c = 0u; c < cascades; ++c) {
-        const auto& h0 = ocean_cascades_[c]->H0();
-        const auto& hc = ocean_cascades_[c]->H0Conj();
-        if (h0.size() != per || hc.size() != per) {
-            LOG_ERROR("ocean: cascade {} spectrum is {}x{} cells, expected {} "
-                      "-- GPU upload skipped", c, h0.size(), hc.size(), per);
-            return;
-        }
-        float* dst = ocean_gpu_h0_staging_.data() + per * c * 4u;
-        for (std::size_t i = 0; i < per; ++i) {
-            dst[i * 4u + 0u] = h0[i].real();
-            dst[i * 4u + 1u] = h0[i].imag();
-            dst[i * 4u + 2u] = hc[i].real();
-            dst[i * 4u + 3u] = hc[i].imag();
-        }
-        ocean_gpu_spectrum_rev_[c] = ocean_cascades_[c]->SpectrumRevision();
-    }
-    device_->WriteBuffer(pt::rhi::BufferHandle{ocean_gpu_h0_buf_id_},
-                         ocean_gpu_h0_staging_.data(),
-                         ocean_gpu_h0_staging_.size() * sizeof(float));
-}
-
-void Engine::DispatchOceanCascades(pt::rhi::CommandBuffer* cb) {
-    if (cb == nullptr || !ocean_gpu_pending_) return;
-    ocean_gpu_pending_ = false;
-    const std::uint32_t grid     = ocean_gpu_buf_grid_;
-    const std::uint32_t cascades = ocean_gpu_buf_cascades_;
-    if (grid == 0u || cascades == 0u) return;
-    const int slot = ocean_tex_slot_;
-    if (ocean_disp_tex_id_[slot] == 0 || ocean_normal_tex_id_[slot] == 0) {
-        return;
-    }
-
-    // The push layout and the five-pass sequence live in
-    // src/physics/OceanCascadeDispatch.h, shared verbatim with
-    // tests/pt_ocean_gpu_test.cpp. A wire format with two call sites is a
-    // wire format with two transcriptions, and #248's lesson was that the
-    // second one rots quietly.
-    pt::ocean::GpuCascadeDispatch d;
-    d.pipeline    = ocean_gpu_pipeline_id_;
-    d.h0_buf      = ocean_gpu_h0_buf_id_;
-    d.scratch_buf = ocean_gpu_scratch_buf_id_;
-    d.foam_buf    = ocean_gpu_foam_buf_id_;
-    d.reduce_buf  = ocean_gpu_reduce_buf_id_;
-    d.disp_tex    = ocean_disp_tex_id_[slot];
-    d.normal_tex  = ocean_normal_tex_id_[slot];
-    d.grid        = grid;
-    d.cascades    = cascades;
-    d.t_seconds     = ocean_gpu_t_;
-    d.choppiness    = ocean_gpu_lambda_;
-    d.foam_threshold = ocean_gpu_foam_thr_;
-    d.foam_amount   = ocean_gpu_foam_amt_;
-    d.foam_decay    = ocean_gpu_decay_;
-    d.wind_coverage = ocean_gpu_wind_cov_;
-    // The march bracket carries the SAME slack the CPU path puts on
-    // ocean_params0.w: 25% over the summed peak crest so the upper bound
-    // clears the tallest wave even mid-bilinear-interpolation, plus 5 cm so
-    // a dead-calm sea still has a band to march.
-    d.bracket_scale = 1.25f;
-    d.bracket_bias  = 0.05f;
-    d.gravity       = ocean_gpu_gravity_;
-    d.period_m[0]   = kOceanCascadePeriodM[0];
-    d.period_m[1]   = kOceanCascadePeriodM[1];
-    d.period_m[2]   = kOceanCascadePeriodM[2];
-    pt::ocean::RecordOceanCascades(cb, d);
 }
 
 void Engine::EnsureOceanUploaded() {
@@ -25424,33 +23426,10 @@ void Engine::EnsureOceanUploaded() {
     const std::uint32_t grid = ocean_->GridSize();
     if (grid == 0u) return;
 
-    // --- Planetary P5 (#259): the stacked cascade atlas --------------------
-    // One cascade is the Wave 8 layout unchanged: a grid x grid texture pair.
-    // Three cascades stack into a grid x (3*grid) atlas, cascade c owning
-    // rows [c*grid, (c+1)*grid). Stacked rather than three texture pairs
-    // because texture slots are the scarce resource -- PathTrace already
-    // saturates Apple Silicon's 8-read_write compute cap, and pbr_atlas is
-    // deliberately declared last so it lands at MSL index 16 without moving
-    // anything. Six textures would need four more slots and would move it.
-    const std::uint32_t cascades =
-        static_cast<std::uint32_t>(ocean_cascades_.size());
-    // --- #259 / #133 Phase 2: the metadata row ----------------------------
-    // With cascades the DISPLACEMENT atlas carries one row past the last
-    // cascade holding the ray-march bracket (see DispatchOceanCascades for
-    // why it travels in the texture at all). oceanBilinearTexelsC wraps
-    // modulo `grid` INSIDE a cascade's own band and then adds c*grid, so no
-    // sample can reach row cascades*grid -- the row is addressable only by
-    // the explicit fetch in oceanRayMarchShell. The NORMAL atlas has no
-    // metadata and stays exactly as tall as the cascades themselves.
-    const std::uint32_t tex_h  = grid * std::max(cascades, 1u);
-    const std::uint32_t disp_h = tex_h + (cascades > 0u ? 1u : 0u);
-
-    // How deep the upload ring has to be. With the GPU solver the field is
-    // written by a compute pass inside the frame's own command buffer, so
-    // there is no host write to race a GPU read and one slot is correct --
-    // 6 MB/frame of upload and 2/3 of the residency, both recovered. With
-    // the CPU solver the race is real and the ring is the fix.
-    const int ring = OceanUploadRingFor(ocean_gpu_owns_field_);
+    // Single-tile Wave 8 (#25) layout: a grid x grid displacement + normal
+    // texture pair, CPU-solved and re-uploaded each frame through the ring.
+    const std::uint32_t tex_h = grid;
+    const int ring = kOceanUploadRing;
 
     // Advance the upload ring FIRST, so everything below -- allocation, the
     // write, and the bind BuildAndDispatch does later this frame -- refers
@@ -25459,14 +23438,11 @@ void Engine::EnsureOceanUploaded() {
     const int slot = ocean_tex_slot_;
 
     // (Re)allocate the displacement + normal textures on first use or when
-    // the grid size (or cascade count) changed. RGBA32F (not 16F) so the
-    // negative, wide-range displacement + slope values survive without the
-    // f16 precision loss that would shimmer the heightfield ray-march at
-    // grazing angles. Two N^2 RGBA32F textures = 2 MB per slot at N=256,
-    // 6 MB per slot with three cascades.
+    // the grid size changed. RGBA32F (not 16F) so the negative, wide-range
+    // displacement + slope values survive without the f16 precision loss
+    // that would shimmer the heightfield ray-march at grazing angles.
     const bool shape_changed =
-        (ocean_tex_grid_ != grid || ocean_tex_cascades_ != cascades ||
-         ocean_tex_ring_ != ring);
+        (ocean_tex_grid_ != grid || ocean_tex_ring_ != ring);
     if (shape_changed || ocean_disp_tex_id_[slot] == 0 ||
         ocean_normal_tex_id_[slot] == 0) {
         // A shape change invalidates EVERY slot, not just this one: the
@@ -25491,7 +23467,7 @@ void Engine::EnsureOceanUploaded() {
                 continue;
             }
             auto disp = device_->CreateTexture({
-                .width = grid, .height = disp_h,
+                .width = grid, .height = tex_h,
                 .format = pt::rhi::TextureFormat::RGBA32F,
                 .usage  = pt::rhi::TextureUsage::Storage,
                 .debug_name = "ocean_displacement",
@@ -25511,71 +23487,19 @@ void Engine::EnsureOceanUploaded() {
             ocean_disp_tex_id_[i]   = disp.id;
             ocean_normal_tex_id_[i] = nrm.id;
         }
-        ocean_tex_grid_      = grid;
-        ocean_tex_cascades_  = cascades;
-        ocean_tex_ring_      = ring;
+        ocean_tex_grid_ = grid;
+        ocean_tex_ring_ = ring;
         LOG_INFO("ocean: FFT displacement {}x{} + normal {}x{} RGBA32F"
-                 " ({} cascade{}, {} upload slot{}, {} solver)",
-                 grid, disp_h, grid, tex_h, std::max(cascades, 1u),
-                 std::max(cascades, 1u) == 1u ? "" : "s", ring,
-                 ring == 1 ? "" : "s",
-                 ocean_gpu_owns_field_ ? "gpu" : "cpu");
+                 " ({} upload slots)", grid, tex_h, grid, tex_h, ring);
     }
 
-    // The GPU solver writes both atlases itself, in the frame's own command
-    // buffer, immediately before the dispatch that reads them. Nothing to
-    // repack and nothing to upload.
-    if (ocean_gpu_owns_field_) return;
-
-    if (cascades == 0u) {
-        const auto& disp_rgba = ocean_->DisplacementRGBA();
-        const auto& nrm_rgba  = ocean_->NormalRGBA();
-        device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_[slot]},
-                              disp_rgba.data(),
-                              disp_rgba.size() * sizeof(float));
-        device_->WriteTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[slot]},
-                              nrm_rgba.data(), nrm_rgba.size() * sizeof(float));
-        return;
-    }
-
-    // Repack the cascades into the stacked atlas. Both source fields are
-    // row-major grid x grid RGBA, so "stack along rows" is a concatenation
-    // and the scratch vectors keep it allocation-free after the first frame.
-    const std::size_t per = static_cast<std::size_t>(grid) * grid * 4u;
-    const std::size_t meta_row = static_cast<std::size_t>(grid) * 4u;
-    ocean_atlas_disp_.resize(per * cascades + meta_row);
-    ocean_atlas_nrm_.resize(per * cascades);
-    for (std::uint32_t c = 0u; c < cascades; ++c) {
-        const auto& d = ocean_cascades_[c]->DisplacementRGBA();
-        const auto& n = ocean_cascades_[c]->NormalRGBA();
-        if (d.size() != per || n.size() != per) continue;
-        std::copy(d.begin(), d.end(), ocean_atlas_disp_.begin() + per * c);
-        std::copy(n.begin(), n.end(), ocean_atlas_nrm_.begin() + per * c);
-    }
-    // --- The metadata row, written by BOTH solvers ------------------------
-    // oceanRayMarchShell reads its band bracket from ocean_displacement
-    // [uint2(0, cascades*grid)].x. The GPU path has to put it there because
-    // the peak crest only exists after its reduce pass; this path puts the
-    // IDENTICAL float there -- ocean_max_disp_y_ through exactly the
-    // expression that used to reach the shader as ocean_params0.w -- so the
-    // shader reads one number from one place whoever solved the field, and
-    // no committed golden moved when the fetch changed.
-    {
-        const float bracket = ocean_max_disp_y_ * 1.25f + 0.05f;
-        for (std::uint32_t x = 0u; x < grid; ++x) {
-            float* t = ocean_atlas_disp_.data() + per * cascades + x * 4u;
-            t[0] = bracket;
-            t[1] = (cascades > 0u) ? ocean_cascades_[0]->MaxDisplacementY() : 0.0f;
-            t[2] = (cascades > 1u) ? ocean_cascades_[1]->MaxDisplacementY() : 0.0f;
-            t[3] = (cascades > 2u) ? ocean_cascades_[2]->MaxDisplacementY() : 0.0f;
-        }
-    }
+    const auto& disp_rgba = ocean_->DisplacementRGBA();
+    const auto& nrm_rgba  = ocean_->NormalRGBA();
     device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_[slot]},
-                          ocean_atlas_disp_.data(),
-                          ocean_atlas_disp_.size() * sizeof(float));
+                          disp_rgba.data(),
+                          disp_rgba.size() * sizeof(float));
     device_->WriteTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[slot]},
-                          ocean_atlas_nrm_.data(),
-                          ocean_atlas_nrm_.size() * sizeof(float));
+                          nrm_rgba.data(), nrm_rgba.size() * sizeof(float));
 }
 // --- end Wave 8 ocean ------------------------------------------------------
 
