@@ -7833,59 +7833,80 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // RGBA16F write per pixel per frame on non-AOV
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
-            // MetalFX demodulation guard.
+            // MetalFX demod-guide de-skew (empirical clamp; data below).
             //
-            // MTLFXTemporalDenoisedScaler divides the input colour by this
-            // diffuse-albedo guide internally, reconstructs the demodulated
-            // "lighting", then re-multiplies. That is only valid where the
-            // radiance IS diffuse-albedo-modulated. On a planet it often is
-            // not: a distant water or dark-terrain pixel near the horizon
-            // carries a near-black, spectrally-skewed surface albedo (deep
-            // water ~0.02-0.06) while its visible radiance is dominated by
-            // NON-diffuse terms -- the Cox-Munk sun-glint and, above all,
-            // the additive aerial-perspective in-scatter, neither of which
-            // scales with the surface albedo. Dividing a bright haze colour
-            // (~40-80 in these units) by a ~0.02 albedo yields a demod
-            // signal of thousands, skewed by the albedo's own per-channel
-            // ratio, and MetalFX's sharpening reconstruction overshoots it
-            // into the bright magenta/green "aurora" band the user sees
-            // along the horizon over distant water and ridges. Measured on
-            // the raw MetalFX output: R and B pinned at ~2048, G left at
-            // ~20 -- vivid magenta from an accum pixel that was ~(77,50,28).
+            // MTLFXTemporalDenoisedScaler divides the input colour C by this
+            // diffuse-albedo guide A internally, reconstructs the demodulated
+            // "lighting", then re-multiplies -- a NON-LINEAR reconstruction,
+            // R(C/A)*A, not a plain divide-then-multiply. That conditioning
+            // is only well-posed where the radiance IS diffuse-albedo-
+            // modulated. On a planet it often is not: a distant, dark,
+            // spectrally-SKEWED surface near the horizon carries a near-black
+            // per-channel-uneven albedo, while its visible radiance is
+            // dominated by NON-diffuse ADDITIVE terms -- the aerial-
+            // perspective in-scatter (~40-80 in these units) and the Cox-Munk
+            // sun-glint at a low sun -- neither of which scales with the
+            // surface albedo. Dividing a bright additive radiance by a
+            // near-black skewed albedo yields a demod signal of thousands
+            // whose per-channel ratio is the albedo's own, and MetalFX's
+            // sharpening reconstruction overshoots it into the vivid
+            // magenta/green "aurora" band reported live along the horizon
+            // over distant water and ridges during a low-sun flyover.
             //
-            // Floor the guide per channel to an achromatic minimum. This
-            // does two things at once. (1) It removes the HUE SKEW: the
-            // albedos that trigger the artefact are all darker than the
-            // floor in every channel, so they clamp to the same grey value
-            // and the demod divisor stops carrying the albedo's per-channel
-            // ratio -- any residual MetalFX overshoot then stays neutral
-            // instead of magenta. (2) It BOUNDS THE MAGNITUDE: colour / guide
-            // can no longer exceed colour / floor, keeping the demodulated
-            // signal inside the range MetalFX already reconstructs cleanly
-            // elsewhere in the same frame (the physical sky reaches ~90 in
-            // these units and denoises without artefact). The transform is
-            // LOSSLESS for the final colour -- MetalFX divides and then
-            // re-multiplies by the SAME guide -- so no highlight is dimmed
-            // and no energy is added; only the intermediate signal MetalFX
-            // reconstructs is made well-conditioned.
+            // WHICH surface. The near-black skewed albedo is DARK LAND-COVER
+            // (forest ~0.05-0.15, soil, rock) and -- over water -- the P3
+            // analytic planet BODY textured with near-black MODIS ocean
+            // colour (r_planet_ground_albedo ~0.06, blue-skewed). It is NOT
+            // the wave-ocean shell: that writes a neutral albedo of 1.0 (its
+            // colour comes from absorption, not albedo -- see the MAT_WATER
+            // shell block above), so max(1.0, floor) is a no-op and open
+            // ocean is never touched here.
             //
-            // The floor is 0.3. A surface darker than that carries almost no
-            // diffuse texture detail for the demodulation to protect, so
-            // clamping its guide is pure robustness with no perceptible loss
-            // -- while a brighter, genuinely textured surface keeps its true
-            // albedo guide and the full demod benefit. Measured: 0.3 is the
-            // point at which the blow-up count reaches zero across a sun
-            // sweep from 2 deg (deep twilight, worst case) to 35 deg
-            // (daytime); lower floors leave a handful of edge fireflies,
-            // higher ones only flatten more demod for no further gain.
+            // WHAT the floor does. Clamping the guide per channel to an
+            // achromatic minimum DE-SKEWS the near-black albedos: they clamp
+            // to the same grey in every channel, so the demod divisor stops
+            // carrying the albedo's per-channel ratio and any residual
+            // MetalFX overshoot stays neutral instead of coloured. It does
+            // NOT bound the demod magnitude into some "clean" range: a
+            // floored pixel still demodulates to ~haze/0.3 = 130-270, above
+            // the ~90 the physical sky reaches -- so the DE-SKEW, not a
+            // magnitude bound, is the mechanism that removes the colour.
             //
-            // Gated on write_specular_albedo_gbuffer, which the engine sets
-            // ONLY for the MetalFX-consuming denoiser kinds (issue #118), so
-            // the pure-SVGF path -- which demodulates in the engine's own
-            // shaders with its own kDemodEps floor and sky cutoff, and is
-            // the path the golden matrix pins -- writes the raw albedo
-            // unchanged. Surface hits only: sky/miss keeps its float3(0)
-            // sentinel so the scaler still treats the sky as un-demodulated.
+            // NOT LOSSLESS. Because R(C/A)*A is non-linear, changing A shifts
+            // the reconstructed colour even though the SAME A is used on both
+            // sides. Measured on planet_aerial (metalfx, 64 frames) against
+            // the raw-albedo guide: at this floor, 9.8k px change by >8/255
+            // and 5.7k dim (peak delta 127). The collateral scales steeply
+            // with the floor (0.2 -> ~3.5k px changed, 0.3 -> ~9.8k, 0.5 ->
+            // ~21k), so this is an empirical, scene-dependent reconstruction
+            // change -- net-beneficial where the artifact occurs, at a small
+            // cost to demod detail on genuinely-dark diffuse surfaces
+            // elsewhere. Not a free transform.
+            //
+            // WHY 0.3, and why EMPIRICAL. MetalFX's demodulation is a closed
+            // black box, so the demod ratio at which it starts to overshoot
+            // can only be MEASURED, not derived. 0.3 is the author's live
+            // magenta-count-zero point across a 2-35 deg sun sweep. A lower
+            // floor (0.15-0.2) would roughly halve the collateral above IF it
+            // still suppresses the artifact -- unverified, because the
+            // overshoot is a moving-camera phenomenon the static golden
+            // harness does not reproduce (issue #337). Kept at the live-
+            // validated value; narrowing is follow-up once a moving-camera
+            // repro exists.
+            //
+            // REACH. Fires on EVERY surface hit with albedo < 0.3, not just
+            // the reported water/ridges. Gated on write_specular_albedo_-
+            // gbuffer, which the engine sets for THREE denoiser kinds --
+            // MetalFX, SvgfBasicMetalFx, SvgfAtrousMetalFx (issue #118). On
+            // the two chained kinds the engine's OWN SVGF demod
+            // (DenoiseTemporal/Atrous + DenoiseRemod, binding 12) also
+            // consumes this floored guide; it round-trips exactly, because
+            // its demod divide and its remod multiply both read the same
+            // albedo_tex and its kDemodEps=0.01 clamp is below 0.3, so the
+            // floored value cancels. The pure-SVGF / NRD kinds do NOT set the
+            // gate, so they write the raw albedo unchanged (the path the
+            // golden matrix pins). Surface hits only: sky/miss keeps its
+            // float3(0) sentinel so the scaler treats the sky as un-demodulated.
             const float kMetalFxDemodFloor = 0.3;
             float3 guide = hit_albedo;
             if (write_specular_albedo_gbuffer != 0u && h0.hit) {
