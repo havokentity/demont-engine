@@ -588,6 +588,32 @@ else()
     target_compile_options(pt_math_epsilon PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
+# --- pt_tonemap_flare_gate (issue #335, sun-lensflare) ---------------------
+# Locks the physical lens-flare visibility gate in shaders/Tonemap.slang
+# against the fp32 whole-frame-black regression it fixed: the old direct
+# gate (sun_lum/5)^16 / (...+1) overflowed fp32 to +Inf and NaNed every
+# pixel at the physical solar disc (sun_lum ~ 1.59e6), while the shipped
+# reciprocal form 1/(1+(5/sun_lum)^16) stays finite. The flare is
+# swapchain-only (the offline capture reads accum_hdr), so NO golden can
+# see it (#337) and no float64 reproduction can either -- this pure-host
+# fp32 mirror is the only automated protection, and unlike the Metal
+# goldens it actually runs in CI.
+#
+# CRITICAL: this target must NOT build with -ffast-math (unlike its
+# sibling shader-mirror tests pt_math_sphere / _altitude / _atmosphere).
+# -ffast-math implies -ffinite-math-only, under which the compiler may
+# assume Inf/NaN cannot occur and fold std::isfinite(...) to a constant
+# true -- which would make the red half of the red-then-green test
+# vacuously pass. The overflow -> Inf -> NaN chain is precisely what this
+# test asserts, so it needs strict IEEE fp32 (the pt_add_test default; the
+# library-level policy is not applied to test binaries). PT_SHADER_TONEMAP
+# _PATH lets the shader-pin case re-read Tonemap.slang so the host mirror
+# cannot silently drift away from the shipped gate.
+pt_add_test(pt_tonemap_flare_gate
+    pt_tonemap_flare_gate_test.cpp)
+target_compile_definitions(pt_tonemap_flare_gate PRIVATE
+    PT_SHADER_TONEMAP_PATH="${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang")
+
 # --- pt_physics unit tests (issue #132) ------------------------------------
 # Phase 1 Verlet physics: handle invalidation (Remove+Add generation
 # bump; 24-bit gen wraparound guard), free-fall trajectory matches

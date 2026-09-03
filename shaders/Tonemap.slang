@@ -590,6 +590,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 // finite range but cannot overflow: a bright sun drives
                 // inv -> 0 (vis -> 1); a dark sample drives inv -> +Inf,
                 // giving vis = 1/(1+Inf) = 0 (correctly gated off, no NaN).
+                //
+                // This gate is locked in fp32 by a host unit test; the flare
+                // is swapchain-only, so no golden can see it (#337). If you
+                // touch the two lines below, update that test's transcription
+                // and its shader pin --
+                // keep in sync with tests/pt_tonemap_flare_gate_test.cpp
                 float inv = 5.0 / max(sun_lum, 1e-8);
                 inv = inv * inv; inv = inv * inv; inv = inv * inv; inv = inv * inv;  // (5/sun_lum)^16
                 float vis = 1.0 / (1.0 + inv);
