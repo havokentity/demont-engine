@@ -10304,9 +10304,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // coarser than the ~1/freq cloud features -- and the point-
                     // sampled in-scatter then jumped as the span moved with
                     // altitude (the deck "changing abruptly" flying through it).
-                    // The long rationale lives in CloudsRaymarch.slang, whose
-                    // pre-pass uses the identical schedule so the two
-                    // r_clouds_mode paths agree. SMOKE (ground plumes, short
+                    // The long rationale (and the EMPIRICAL / step-budget basis
+                    // for the 0.07 fraction, the [8,160] m bounds and the 1.04
+                    // growth -- none of them a physical LOD) lives in
+                    // CloudsRaymarch.slang. That procedural pre-pass uses the
+                    // SAME formula, but keyed off a DIFFERENT cvar
+                    // (r_clouds_raymarched_samples, /32) than this inline path
+                    // (r_volumetric_samples, /24): the two r_clouds_mode paths
+                    // share the mechanism but are each normalized to their own
+                    // cvar's reference, so equal sample-count settings do NOT
+                    // give an identical near-step. SMOKE (ground plumes, short
                     // spans, no span-driven pop) keeps the uniform stratified
                     // march bit-for-bit, so growth is gated to the pure-cloud
                     // case and every smoke golden is unchanged.
@@ -10315,11 +10322,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float cl_thickness  = max(top_y - base_y, 1.0);
                     // Sample-count knob (r_volumetric_samples) scales the near
                     // step: more samples -> finer, fewer -> coarser, always
-                    // span-independent. 24 is the neutral reference (planet
-                    // fixtures' value).
+                    // span-independent. The /24 makes cl_quality == 1.0 at the
+                    // sample count the planet_horizon_clouds fixtures render at
+                    // (24), so those goldens sit at the reference near-step. It
+                    // is NOT this cvar's default (16), and NOT the raymarch
+                    // path's /32 -- the divisor is per-mode (see above).
                     float cl_quality = clamp(float(N), 4.0, 64.0) * (1.0 / 24.0);
                     float cl_dt0 = clamp(min(cl_wavelength, cl_thickness)
                                           * (0.07 / cl_quality), 8.0, 160.0);
+                    // Step-budget growth (see CloudsRaymarch.slang); not a
+                    // physical/solid-angle LOD.
                     const float cl_growth = 1.04;
                     float trans_eye_c = 1.0;
                     float3 v_color_c  = float3(0.0);

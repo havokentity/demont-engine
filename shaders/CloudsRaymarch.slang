@@ -513,26 +513,46 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // the integrated in-scatter jump as the camera moved ("clouds change
     // abruptly" flying through the deck). Pinning the near-field step to
     // the field scale makes the sampling stationary in altitude, and the
-    // step grows with distance (solid-angle LOD: a cloud feature past a
-    // few km subtends less than one step of angle) so the march still
-    // reaches the horizon deck within a bounded sample budget -- the same
-    // geometric-growth idea lightMarch() already uses toward the sun.
+    // step then GROWS with distance so a bounded number of samples still
+    // reaches the horizon deck -- the same geometric-growth budgeting
+    // lightMarch() already uses toward the sun.
+    //
+    // The growth is a STEP-BUDGET choice, not a physical LOD. At this FOV
+    // 1.04/step is ~2.3 deg of arc, tens of pixels wide -- ~20-30x a pixel
+    // footprint, i.e. far coarser than one pixel -- so it does NOT track
+    // solid angle or a per-pixel footprint. It is picked purely to land the
+    // far deck inside the loop cap (see cl_growth below); the near step
+    // carries the resolution, the growth just stops the tail from blowing
+    // the budget.
     //
     // dt0: near-field step. Resolve the finer of the base noise wavelength
-    //      (1/freq) and the layer thickness; a fraction ~1/14 of the
-    //      wavelength tracks the effective edge frequency the coverage
-    //      threshold introduces on top of the base octave. Bounded so a
-    //      degenerate freq/thickness can't drive it to 0 or to the whole
-    //      layer. The user sample-count knob (raymarch_quality.w) scales
-    //      it: more samples -> finer near step (higher quality), fewer ->
-    //      coarser, span-independent either way.
+    //      (1/freq) and the layer thickness, then take an EMPIRICAL fraction
+    //      (0.07 at reference quality) of it -- small enough that the base
+    //      octave and the extra edge frequency the coverage threshold adds
+    //      are both resolved, large enough to stay inside the step budget.
+    //      (0.07 is tuned, not derived; the earlier "~1/14 of the edge
+    //      frequency" framing overstated it.) The [8,160] m clamp is
+    //      likewise empirical: a floor so a degenerate freq/thickness can't
+    //      drive the step to 0, a ceiling so it can't grow to the whole
+    //      layer.
+    //      Normalization: raymarch_quality.w is r_clouds_raymarched_samples,
+    //      scaled by 1/32 so cl_quality == 1.0 at THIS cvar's default (32).
+    //      This is a SEPARATE normalization from the inline path, which keys
+    //      off a different cvar (r_volumetric_samples) scaled by 1/24; the
+    //      two r_clouds_mode paths share this formula but are each normalized
+    //      to their own cvar's reference, so equal sample-count settings do
+    //      NOT give an identical near-step (see PathTrace.slang and the cloud
+    //      pre-pass note in Engine.cpp). More samples -> finer near step,
+    //      fewer -> coarser, span-independent either way.
     float cl_wavelength = 1.0 / max(clouds_p2.z, 1e-6);
     float cl_thickness  = max(top_y - base_y, 1.0);
     float cl_quality    = clamp(raymarch_quality.w, 8.0, 128.0) * (1.0 / 32.0);
     float dt0 = clamp(min(cl_wavelength, cl_thickness) * (0.07 / cl_quality),
                       8.0, 160.0);
-    // Per-step growth. 1.04 reaches a ~60-80 km horizon chord in ~110-140
-    // steps from a dt0 of tens of metres, well under the 256 loop cap.
+    // Per-step growth. EMPIRICAL step-budget constant: 1.04 reaches a
+    // ~60-80 km horizon chord in ~110-140 steps from a dt0 of tens of
+    // metres, well under the 256 loop cap. Chosen to fit that budget, not
+    // to hold a pixel-sized footprint (which it does not -- see header).
     const float cl_growth = 1.04;
     float dt = dt0;
     float t  = t_in;

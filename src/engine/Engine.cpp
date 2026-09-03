@@ -12408,10 +12408,19 @@ void Engine::RenderFrame() {
         std::memcpy(cp.sun_extra,      push.sun_extra,      sizeof(cp.sun_extra));
         std::memcpy(cp.planet_center_radius, push.planet_center_radius,
                     sizeof(cp.planet_center_radius));
-        // Clouds parameters come straight from the PathTrace push that
-        // was just dispatched, so the two modes interpret the same cvar
-        // set identically (modulo the cloud_dens skip inside the path
-        // tracer's main()).
+        // Cloud SHAPE parameters (clouds_p1..p4: coverage, density,
+        // frequency, ...) come straight from the PathTrace push that was
+        // just dispatched, so both modes read the same shape cvar values
+        // identically (modulo the cloud_dens skip inside the path tracer's
+        // main()). The march SAMPLE COUNT is the exception: this pre-pass
+        // takes it from r_clouds_raymarched_samples (raymarch_quality[3]
+        // below), while the inline path takes it from r_volumetric_samples,
+        // and each shader normalizes its field-scale near-step to its own
+        // cvar's reference (/32 here, /24 inline). So the two r_clouds_mode
+        // paths share the cloud shape but are NOT on a single shared step
+        // schedule -- equal sample-count settings give different near-steps
+        // by design (see the continuous-step blocks in CloudsRaymarch.slang
+        // and PathTrace.slang).
         std::memcpy(cp.clouds_p1,      push.clouds_p1,      sizeof(cp.clouds_p1));
         std::memcpy(cp.clouds_p2,      push.clouds_p2,      sizeof(cp.clouds_p2));
         std::memcpy(cp.clouds_p3,      push.clouds_p3,      sizeof(cp.clouds_p3));
