@@ -554,13 +554,22 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 float2 dimf = float2(dim);
                 float2 sun_c = sun_uv - 0.5;
 
-                // Sun-visibility gate. Sample hdr_in around sun_uv with
-                // a 3x3 max so we don't miss bright sub-pixel sources.
-                // The path tracer's sky integrator writes night-sky
-                // luminance (~0.001) when the sun is below the horizon
-                // and writes building/terrain luminance when occluded;
-                // both naturally collapse the gate.
+                // Sun-visibility gate + source chromaticity. Sample hdr_in
+                // around sun_uv with a 3x3 max so we don't miss bright
+                // sub-pixel sources. The path tracer's sky integrator writes
+                // night-sky luminance (~0.001) when the sun is below the
+                // horizon and writes building/terrain luminance when
+                // occluded; both naturally collapse the gate.
+                //
+                // sun_rgb captures the RGB radiance of the BRIGHTEST tap --
+                // the sun disc's own spectral colour as the atmosphere
+                // rendered it. A low sun seen through a long air path is
+                // reddened by Rayleigh extinction, so a real lens flare from
+                // a setting sun is red, not white. Carrying sun_rgb (below)
+                // makes the flare inherit that chromaticity; the luminance-
+                // only gate discarded it and tinted every flare white.
                 float sun_lum = 0.0;
+                float3 sun_rgb = float3(0.0);
                 if (sun_uv.x >= 0.0 && sun_uv.x <= 1.0 &&
                     sun_uv.y >= 0.0 && sun_uv.y <= 1.0) {
                     int2 sc = int2(sun_uv * dimf);
@@ -570,10 +579,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
                                            int2(0, 0), int2(dim) - int2(1, 1));
                             float3 s = hdr_in[uint2(p)].rgb;
                             float lm = dot(s, float3(0.2126, 0.7152, 0.0722));
-                            sun_lum = max(sun_lum, lm);
+                            // Track the RGB at the max-luminance tap (not a
+                            // per-channel max, which would desaturate).
+                            if (lm > sun_lum) { sun_lum = lm; sun_rgb = s; }
                         }
                     }
                 }
+                // Source chromaticity: the sun's RGB normalised by its own
+                // Rec.709 luminance. The luma coefficients sum to exactly 1,
+                // so a NEUTRAL source (R=G=B) gives sun_chroma = (1,1,1) and
+                // the composite below is byte-identical to the luminance-only
+                // version -- an orbital white sun stays white. A reddened low
+                // sun gives a chroma weighted to red. sun_lum * sun_chroma is
+                // algebraically sun_rgb (the source radiance); it is written
+                // factored so the magnitude that drives exposure survival
+                // (sun_lum) and the colour it carries (sun_chroma) read
+                // separately, and so the per-ghost lens dispersion below
+                // MODULATES the source colour rather than replacing it.
+                float3 sun_chroma = sun_rgb / max(sun_lum, 1e-8);
                 // Higher-order Reinhard centred on sun_lum = 5 (between
                 // a bright wall ~1 and the un-occluded sun). Smooth
                 // transition: ~0 below threshold, ~1 above.
@@ -704,18 +727,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 // to off-axis angle. Without this fade the ghosts pile
                 // up into one giant blob centred on the sun.
                 float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
-                // sun_lum carries the physics: the flare is the source's
-                // own luminance times each path's absolute Fresnel loss
-                // (gi_int) times the artistic gain flare_intensity. Because
-                // it scales with the source and is added in the same linear
-                // HDR that the exposure multiplies next, the flare is a
-                // fixed FRACTION of the (clipped) sun at ANY exposure --
-                // which is what makes it survive the scene's auto-exposure
-                // instead of vanishing under the ~0.02 an orbital frame
-                // meters at. flare_intensity is now a pure look gain (~1 =
-                // the unattenuated Fresnel fraction) rather than the whole
-                // magnitude. See LensFlare.cpp on why gi_int is absolute.
-                c += flare_intensity * sun_lum * flare * fade * vis * sun_off;
+                // sun_lum * sun_chroma carries the physics: the flare is the
+                // source's own spectral radiance (magnitude sun_lum, colour
+                // sun_chroma) times each path's absolute Fresnel loss (gi_int)
+                // times the artistic gain flare_intensity. Because it scales
+                // with the source and is added in the same linear HDR that the
+                // exposure multiplies next, the flare is a fixed FRACTION of
+                // the (clipped) sun at ANY exposure -- which is what makes it
+                // survive the scene's auto-exposure instead of vanishing under
+                // the ~0.02 an orbital frame meters at. flare_intensity is now
+                // a pure look gain (~1 = the unattenuated Fresnel fraction)
+                // rather than the whole magnitude. See LensFlare.cpp on why
+                // gi_int is absolute. sun_chroma tints ghosts AND the aperture
+                // starburst (both are summed into `flare`) with the source's
+                // colour, with each ghost's Abbe-number dispersion (the
+                // per-channel Gaussian offsets in `flare`) modulating on top;
+                // a neutral sun leaves sun_chroma = (1,1,1) and this line
+                // byte-identical to the pre-chromaticity composite.
+                c += flare_intensity * sun_lum * sun_chroma
+                   * flare * fade * vis * sun_off;
             }
             // Passthrough path still needs sRGB OETF on SPIR-V swapchains
             // (BGRA8_UNORM) -- without it the linear LDR `c` reaches the
