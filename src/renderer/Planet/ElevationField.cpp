@@ -233,6 +233,37 @@ double RelativeStructureFunction(double lag_m, double floor_m, double break_m,
            std::pow((lag_m + break_m) / (floor_m + break_m), h_coarse - h_fine);
 }
 
+// The soft-clip exponent. The transfer is the identity to within
+// ~(1/n)*(S_lin/S_c)^n below the threshold, so n sets how much of the
+// sub-threshold band is left untouched. n = 4 is the GENTLEST cap (smallest
+// n, i.e. the softest knee, honouring "a soft cap, not a clip") that still
+// holds the Everest reference slope -- the quantity that classes it as a
+// snowfield -- within 1% of its unsaturated value (measured: -0.7% at n = 4,
+// -1.8% at n = 3), so every terrain class that does not overshoot the
+// threshold is preserved and Everest renders indistinguishably. A gentler
+// knee (n <= 2) visibly reshapes the Everest silhouette; a sharper one
+// (n >= 8) preserves it bit-for-bit but under-draws the Annapurna overshoot.
+// Derived from preserving sub-threshold terrain, not dialled to a look.
+inline constexpr double kHillslopeSoftClipN = 4.0;
+
+double SaturateHillslopeSlope(double disp, double spacing,
+                              double threshold_tan) noexcept {
+    if (!(threshold_tan > 0.0) || !(spacing > 0.0) || !std::isfinite(disp))
+        return disp;
+    // A smooth cap of the slope at the threshold S_c: disp_out = disp *
+    // (1 + (|disp|/(S_c*spacing))^n)^(-1/n). Odd, monotone, concave for
+    // disp > 0 (its derivative (1 + x^n)^(-(n+1)/n) is strictly decreasing),
+    // EXACTLY the identity as disp -> 0, and asymptotes at S_c*spacing -- a
+    // soft cap, not a clip, so steeper ground stays ordered-steeper and
+    // cliffs above S_c still form by ACCUMULATION across levels.
+    const double cap = threshold_tan * spacing;   // the asymptote, S_c*spacing
+    const double x   = std::abs(disp) / cap;      // |S_lin| / S_c
+    if (x < 1e-9) return disp;                     // identity limit; avoids 0^n
+    const double scale = std::pow(1.0 + std::pow(x, kHillslopeSoftClipN),
+                                  -1.0 / kHillslopeSoftClipN);
+    return disp * scale;
+}
+
 // --- ElevationField -------------------------------------------------------
 
 void ElevationField::SampleBaseAndRelief(const glm::dvec3& dir_unit,
@@ -316,6 +347,9 @@ void ElevationField::GenerateChunkHeights(const ChunkKey& key, int level, int ha
     // landscape; the default 1.0 is the marginal, slope-invariant case.
     const double Hf = std::clamp(params_.hurst_fine, H, 2.0);
     const double break_m = std::max(params_.hillslope_break_m, 0.0);
+    // Threshold-hillslope saturation (#330). A pure function of the level's
+    // displacement, so it does not disturb level consistency; <= 0 disables.
+    const double threshold_tan = params_.hillslope_threshold_slope;
 
     std::vector<double> prev, cur;
     std::int64_t plo_x = 0, phi_x = 0, plo_y = 0, phi_y = 0;
@@ -401,9 +435,16 @@ void ElevationField::GenerateChunkHeights(const ChunkKey& key, int level, int ha
                         const glm::dvec3 dir = FaceParamToDirection(key.face, s, t);
                         double base_unused = 0.0, relief = 0.0;
                         SampleBaseAndRelief(dir, base_unused, relief);
-                        const double disp = amp_scale * relief *
-                                            HashSigned(ix, iy, iz, l, params_.seed);
-                        // Threshold-hillslope cap. See ElevationParams::max_slope.
+                        double disp = amp_scale * relief *
+                                      HashSigned(ix, iy, iz, l, params_.seed);
+                        // Threshold-hillslope SATURATION (#330): draw the
+                        // displacement toward the landsliding threshold before
+                        // it accumulates, so a hillslope's angle saturates
+                        // rather than rising linearly with relief.
+                        disp = SaturateHillslopeSlope(disp, spacing, threshold_tan);
+                        // Threshold-hillslope cap: an outer backstop for the
+                        // rare bedrock excursion the soft saturation leaves
+                        // above max_slope. See ElevationParams::max_slope.
                         v += std::clamp(disp, -slope_cap, slope_cap);
                     }
                 }

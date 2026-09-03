@@ -435,14 +435,35 @@ void BuildTerrainChunk(const ChunkKey& key,
             cy[static_cast<std::size_t>(y)] =
                 TangentWarp(GridParam(cbase_y + y, Gc)) * face_u;
         }
+        // The threshold-hillslope saturation (#330) draws the pointwise
+        // reference slope toward S_c; the area-mean branch must prefilter the
+        // SAME saturated slope or the two mip levels disagree where relief is
+        // high. The saturation is a per-vertex map on the SLOPE, so its
+        // reduction factor is set by the slope at the reference LAG itself --
+        // relief*S(lag)/lag, the true scale slope -- NOT by the finite-
+        // difference RMS, which kRefSlopeRmsGain inflates by folding in the
+        // finer levels the transfer barely touches. Saturating the inflated
+        // RMS as one slope over-reduces; saturating the true scale slope and
+        // applying that factor to the RMS tracks the pointwise branch to a few
+        // percent across the earth_lite relief range (re-measured in
+        // pt_planet_terrain_test.cpp). rc.S and rc.lag are exactly S(lag) and
+        // the reference lag already hoisted for the RMS.
+        const double thr   = field.Params().hillslope_threshold_slope;
+        const double dgain = std::max(field.Params().detail_gain, 0.0);
         for (int y = 0; y <= kChunkQuads; ++y) {
             for (int x = 0; x <= kChunkQuads; ++x) {
                 const glm::dvec3 dir = glm::normalize(
                     face_n + cx[static_cast<std::size_t>(x)]
                            + cy[static_cast<std::size_t>(y)]);
+                const double sigma_lin = RefRmsSlopeAt(rc, field, dir);
+                // The scale slope at the reference lag, and the factor the
+                // saturation applies to it -- inherited by the reference RMS.
+                const double sigma_ref = dgain * field.Relief(dir) * rc.S / rc.lag;
+                const double factor = (thr > 0.0 && sigma_ref > 0.0)
+                    ? SaturateHillslopeSlope(sigma_ref, 1.0, thr) / sigma_ref
+                    : 1.0;
                 rock01[static_cast<std::size_t>(y) * kChunkVerts + x] =
-                    static_cast<float>(RockFractionFromRmsSlope(
-                        RefRmsSlopeAt(rc, field, dir)));
+                    static_cast<float>(RockFractionFromRmsSlope(factor * sigma_lin));
             }
         }
     }

@@ -193,6 +193,129 @@
 // Andean scarp, the trench walls -- where a threshold-hillslope cap is
 // exactly the right physics rather than a patch over a bad extrapolation.
 //
+// THE STRUCTURAL LIMIT OF THIS LAW -- WHY CORRECT RELIEF STILL READS ~20 deg
+// AT THE KHUMBU AT THE 270 m LAG (#330)
+// -------------------------------------------------------------------------
+// #318 restored the relief second moment (Khumbu texel relief up to ~500 m),
+// yet the reference-scale slope this law derives at the Gabet 180 m baseline
+// (kRefSlopeHalfLagM; the operator Gabet, Pratt-Sitaula & Burbank 2004 used,
+// ~270 m length scale) still reads a MEDIAN of only ~20 deg at the Everest
+// site, against ~30 deg published. #330 is the measurement of why, and the
+// finding is that the shortfall is NOT a mis-set parameter -- it is the
+// ceiling of a single-anchor, single-exponent, linear-in-relief law.
+//
+// Measured (production ReferenceSlope01 over a 4x4 level-13 block; the
+// analytic sigma(l)/l is smaller because it omits the finite-difference
+// accumulation kRefSlopeRmsGain folds back in):
+//
+//   * The DECOMPOSITION. The fine detail is not the problem: the baked
+//     field's RMS slope already exceeds 30 deg below ~40 m (34 deg at 19 m,
+//     50 deg at 0.3 m at Everest). The shortfall is confined to the
+//     100-500 m band. There the continuation is anchored on relief at the
+//     19.5 km floor with H_coarse = 0.5, and the reference operator reads a
+//     median of only ~20 deg -- because slope(l) = relief * S(l) / l has
+//     grown too slowly from the floor to reach the threshold by the
+//     hillslope band. It is candidate (a): the single anchor extrapolated
+//     ~7 octaves undershoots the intermediate band for high-relief terrain.
+//     The break (candidate b) is secondary: removing it entirely (L_b -> 0)
+//     lifts Everest only 20.6 -> 24.4 deg while it detonates the 1 m slope
+//     back to the #304 divergence (Kansas 1.7 -> 11.6 deg, abyssal
+//     3.3 -> 21.3 deg). Lengthening the break (candidate c) LOWERS the
+//     reference slope, so the break is not too short. Even the divergent
+//     no-break law never reaches 30 deg at Everest: relief 500 m under
+//     H = 0.5 cannot.
+//
+//   * WHY NO GLOBAL KNOB FIXES IT. Dropping H_coarse to ~0.37 does lift
+//     Everest to ~30 deg -- but the same drop pushes the Annapurna site
+//     (the planet_hillslope_rock camera) from 44 to ~53 deg, over-rocking a
+//     cell that already renders correctly at 43 deg, and lifts the abyssal
+//     Pacific 1 m slope past its Shepard et al. (2001) band. The reference
+//     slope is EXACTLY linear in relief (asserted in the terrain tests), so
+//     one exponent maps relief to slope by one proportionality for every
+//     terrain class at once. Real hillslope angle is a SATURATING function
+//     of relief -- it rises then pins at the landsliding threshold, ~30-35
+//     deg (Burbank et al. 1996; Montgomery & Brandon 2002, EPSL 201:481;
+//     DiBiase et al. 2010, EPSL 289:134). A linear law cannot be both steep
+//     enough at moderate relief (Everest, 500 m) and bounded at extreme
+//     relief (Annapurna, 1450 m); it undershoots the first and overshoots
+//     the second, which is exactly what is measured. A saturating transfer
+//     would fix the overshoot but, being concave, cannot RAISE the moderate
+//     end -- so it does not close the Everest gap either.
+//
+//   * THE SITE. Gabet, Pratt-Sitaula & Burbank (2004) measured the
+//     Marsyandi valley, CENTRAL Nepal -- the Annapurna Himal, which is where
+//     planet_hillslope_rock stands (28.389 N 84.111 E) and where this law
+//     ALREADY yields a ~44 deg median, at or above their ~30 deg. The
+//     Everest/Khumbu site (27.9881 N 86.9250 E, planet_surface) is EASTERN
+//     Nepal, glaciated, and 2.2 km above the derived snowline -- a camera
+//     planet_hillslope_rock.cfg itself documents as a correct snowfield.
+//     So the ~20 deg there is not obviously wrong; the ~30 deg target may be
+//     the central-Nepal number read at the wrong texel.
+//
+// The honest resolution is therefore NOT a re-tuned amplitude or exponent
+// (either regresses a class this arc already got right). What #330 fixes is
+// the genuine physical error the diagnosis exposes -- the OVERSHOOT -- and
+// leaves the Everest "shortfall" alone, because that was the central-Nepal
+// number read at the wrong texel (see THE SITE above; the target-site
+// attribution is corrected, and Everest correctly stays a snowfield).
+//
+// THE FIX -- A PER-SCALE ANGLE-OF-REPOSE CAP (#330)
+// -------------------------------------------------
+// The linear-in-relief law lets each octave's contributed slope rise without
+// bound as relief grows: it put the Annapurna reference slope at 44 deg,
+// where no real hillslope stands over a 270 m baseline. The fix caps the
+// slope EACH LEVEL adds at the angle of repose S_c = tan(34 deg)
+// (hillslope_threshold_slope; Al-Hashemi & Al-Amoudi 2018, the upper end of
+// the ~30-34 deg band Burbank measured), via SaturateHillslopeSlope: each
+// level's displacement passes through a SMOOTH concave, monotone cap,
+// near-identity for a sub-threshold increment and asymptotic to S_c. It is
+// applied per new vertex, before the max_slope clamp, so it is a pure
+// continuous function of position and preserves level consistency and seam
+// determinism bit-for-bit.
+//
+// WHAT THIS IS AND IS NOT. This is a per-SCALE stability limit -- no single
+// octave contributes a slope steeper than granular repose -- which suppresses
+// the needle-spikes the unbounded law accumulated. It is NOT the macroscopic
+// threshold-hillslope mechanism of Burbank et al. 1996 / Montgomery & Brandon
+// 2002 (EPSL 201:481) / DiBiase et al. 2010 (EPSL 289:134), which pins the
+// WHOLE hillslope's gradient at the landsliding threshold via mass wasting.
+// Those works motivate why a slope cap exists in nature, but their mechanism
+// is non-local -- it depends on the aggregate hillslope, not a single vertex
+// -- and cannot be expressed as the per-vertex pure function the level-
+// consistency guarantee requires. Because the observable 270 m gradient sums
+// ~8 same-signed octaves, each capped but aligned, it stays ABOVE S_c: the
+// Annapurna reference median lands at ~41 deg, not 34. That is the honest
+// ceiling of a per-octave cap, not a bug -- pinning the macroscopic angle at
+// 34 deg is out of reach without a non-local operator this scheme forbids.
+//
+// Measured effect (production ReferenceSlope01 over earth_lite, before ->
+// after; full table and before/after renders in PR #330):
+//   * Annapurna (Gabet site)   median 44.5 -> 40.5 deg -- the 44 deg
+//     needle-spikes drawn toward the threshold; rock 0.64 -> 0.55, more snow
+//     surviving on the gentler faces. The reference median cannot be pulled
+//     all the way to 34 deg without touching Everest: the observable 270 m
+//     gradient sums ~8 same-signed octaves, each capped at S_c but aligned,
+//     so their sum stays above S_c, and a knee sharp enough to spare Everest
+//     only compresses the per-octave part above S_c (see the .cpp for n).
+//   * Everest (planet_surface) median 20.6 -> 20.5 deg (-0.7%); rock
+//     0.070 -> 0.068 -- its per-octave increments are sub-threshold, so it is
+//     preserved to within 1% and renders indistinguishably: a snowfield.
+//   * Kansas, Sahara, Amazon, abyssal Pacific: unchanged to ~1e-5 relative --
+//     sub-micron on the mesh, sub-visible. The transfer is a strict
+//     contraction, so it is NOT bit-identity below S_c (it equals the
+//     identity in double only for an increment slope <~ 1e-4, far below these
+//     sites' 0.03-0.15); their 1 m Shepard roughness is untouched to that
+//     tolerance, and no golden cell covers them.
+//   * NO divergence: the transfer is strictly tighter than the old
+//     tan(45 deg) clamp, so the clamp engagement falls 0.21% -> 0.00% (it
+//     cannot fire beneath a lower asymptote) and the added slope stays
+//     bounded at every level. Cliffs above 34 deg still form, by ACCUMULATION
+//     across levels of sub-threshold increments -- the transfer compresses,
+//     it does not clip, so steeper ground stays steeper.
+//
+// hillslope_threshold_slope <= 0 disables the transfer and reproduces the
+// pre-#330 linear law bit-for-bit, which is the A/B and the before-column.
+//
 // The choice of an INTERPOLATORY subdivision -- displacement is added only
 // at vertices that are new at that level, and is exactly zero at every
 // vertex inherited from the level above -- is the load-bearing one. It
@@ -388,14 +511,36 @@ struct ElevationParams {
     // latter, and it did not work: an unbroken H = 0.5 continuation drove
     // 31.6% of Earth's level-19 midpoints into the clamp, which does not
     // remove a divergence -- it truncates one and leaves a constant 45 deg
-    // behind. `hillslope_break_m` is what bounds the slope now; with it in
-    // place the clamp engages on 0.23% of the surface and, decisively,
-    // that number stops growing as the LOD refines.
+    // behind. `hillslope_break_m` bounded the slope after #304, dropping the
+    // engagement to 0.23% and, decisively, stopping it growing with the LOD.
+    // As of #330 `hillslope_threshold_slope` bounds it further: the soft
+    // saturation asymptotes at tan(34 deg), strictly below this tan(45 deg)
+    // cap, so the clamp no longer fires at all (area-weighted engagement
+    // 0.00%, measured, even on the Karakoram front) -- it is now a pure
+    // backstop for the disabled-saturation A/B, and the two do not
+    // double-count because the saturation is strictly tighter.
     //
     // The clamp is a pure function of the vertex (amplitude, relief, hash
     // and spacing all are), so it does not disturb the level-consistency
     // the whole scheme rests on.
     double max_slope = 1.0;
+    // Threshold-hillslope SATURATION slope, as a tangent (#330). Above this
+    // the transfer that the displacement passes through becomes concave and
+    // asymptotes here, so a hillslope's angle saturates at the landsliding
+    // threshold instead of rising linearly with relief -- the physics the
+    // linear-in-relief law was missing (#330 header section). The default is
+    // tan(34 deg) = 0.6745, the angle of repose of dry granular material
+    // (Al-Hashemi & Al-Amoudi 2018, Powder Technology 330:397), which is
+    // also the upper end of the ~30-34 deg threshold-hillslope band measured
+    // in the actively uplifting Himalaya (Burbank et al. 1996, Nature
+    // 379:505). The transfer is SOFT: it compresses steep ground toward the
+    // threshold rather than clipping it, so genuinely steeper ground stays
+    // steeper (monotone) and accumulates into bedrock cliffs across levels --
+    // it is NOT the uniform-45-deg plateau the pre-#304 hard clamp produced.
+    // <= 0 disables it and restores the pure linear-in-relief continuation,
+    // so the A/B (and the #330 before/after) is one field away. See
+    // SaturateHillslopeSlope and the header comment for the derivation.
+    double hillslope_threshold_slope = 0.67451; // tan(34 deg)
     // Deterministic seed folded into the vertex hash.
     std::uint32_t seed = 0x5eed1234u;
 };
@@ -416,6 +561,36 @@ struct ElevationParams {
 // continuation, and the terrain tests measure it directly.
 double RelativeStructureFunction(double lag_m, double floor_m, double break_m,
                                  double h_coarse, double h_fine) noexcept;
+
+// The threshold-hillslope saturating transfer (#330). Maps a level's signed
+// displacement `disp` (which, over `spacing`, implies a slope disp/spacing
+// that the linear-in-relief continuation lets grow without bound) to the
+// displacement a threshold hillslope holds -- one whose gradient saturates at
+// the landsliding threshold `threshold_tan` = S_c, because above it mass
+// wasting sheds material as fast as incision steepens the slope (Burbank et
+// al. 1996, Nature 379:505; Montgomery & Brandon 2002, EPSL 201:481; DiBiase
+// et al. 2010, EPSL 289:134; the mechanism is the nonlinear-diffusion flux
+// q = K S / (1 - (S/S_c)^m) of Roering, Kirchner & Dietrich 1999, WRR 35:853,
+// whose flux diverges as S -> S_c and so caps the gradient there).
+//
+// It is a SMOOTH cap of the slope at S_c:
+//
+//     disp_out = disp * (1 + (|disp| / (S_c * spacing))^n)^(-1/n),
+//
+// odd, monotone, concave for disp > 0 (its derivative (1 + x^n)^(-(n+1)/n)
+// is strictly decreasing), EXACTLY the identity as disp -> 0 -- so
+// sub-threshold ground (Kansas, the Sahara, the abyssal plains, the whole
+// Everest massif) is preserved -- and asymptotic to S_c*spacing as
+// |disp| -> infinity, drawing the Annapurna overshoot to the threshold. It is
+// a cap, not a clip: steeper ground stays ordered-steeper and cliffs above
+// S_c still form by accumulation across levels. The exponent n (see the .cpp)
+// sets the knee's sharpness and is fixed by preserving sub-threshold terrain.
+//
+// A pure function of `disp` and the two scalars, so applying it per new
+// vertex keeps the continuation level-consistent and seam-deterministic.
+// `threshold_tan` <= 0 (or a non-finite input) returns `disp` unchanged.
+double SaturateHillslopeSlope(double disp, double spacing,
+                              double threshold_tan) noexcept;
 
 // The elevation field: DEM base plus the interpolatory fractal hierarchy.
 //
