@@ -4048,6 +4048,120 @@ float3 starsOnly(float3 rd, float3 sun) {
     return float3(0.0);
 }
 
+// --- Physical-mode stars (#333): the celestial background, no day flag ------
+//
+// starsOnly() above is a GROUND-OBSERVER model. Its `day` factor,
+// smoothstep(-0.10, 0.20, dot(localUp(camera), sun)), multiplies the whole
+// starfield by (1 - day) and gates the sample on `day < 0.6`, so stars vanish
+// whenever the SUN IS ABOVE THE OBSERVER'S LOCAL HORIZON. On the ground that
+// is a serviceable proxy for "the sky is too bright to see stars". It is wrong
+// the instant the observer leaves the air: from orbit dot(localUp, sun) is the
+// angle between the outward radial and the sun, so the entire day hemisphere
+// of any orbit reports day = 1 and the stars are switched off -- even for a
+// ray pointing into empty anti-solar space, where an astronaut plainly sees
+// them (they see stars against black on the sunlit side too, looking away from
+// the lit Earth). Measured on this build: an orbit camera looking at the same
+// patch of black space renders max luminance 14.9 with the sun below the local
+// horizon and 0.0 with it above -- the flag, not the sky, is doing it.
+//
+// The honest model is the one the physical sky already embodies: a star is a
+// point source on the celestial sphere, ALWAYS present, seen THROUGH the
+// atmosphere. What the eye actually receives along the ray is
+//
+//     L = L_star * T_view   +   L_inscatter
+//
+// where T_view is the Beer-Lambert transmittance of the air column the view
+// ray crosses (real extinction: ~1 in vacuum, ~0.8 at the ground zenith,
+// falling to the horizon) and L_inscatter = skyPhysical() is the scattered
+// sunlight glowing in FRONT of the star. skyColor() already ADDS skyPhysical()
+// on top of this term, so the daytime wash-out falls straight out of the sum:
+// a lit air column raises L_inscatter to tens of W/m^2/sr and buries the
+// O(few)-unit star flux, while an unlit column (night) or an empty one (space)
+// leaves L_inscatter ~ 0 and the star stands against black. No sun-elevation
+// flag, no threshold -- the same physics that blacks the sky in space is what
+// hides the stars in daylight. This is the fix for "the stars aren't there in
+// space": nothing about the star changed, the foreground stopped being faked.
+//
+// starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
+// kept a separate function (rather than sharing starsOnly's body) so modes
+// 0-3 and the StarsComposite.slang mirror stay bit-for-bit unchanged. The
+// body-occlusion gate (a ray into the planet has no stars behind it) is kept;
+// twinkle is kept. Any change to the sampling must mirror starsOnly() above.
+float3 starsRadianceRaw(float3 rd) {
+    float3 up       = localUp(pos_fovtan.xyz);
+    float cosTheta  = clamp(dot(rd, up), -1.0, 1.0);
+    bool star_visible = (cosTheta > -0.05);
+    if (planet_center_radius.w > 0.0) {
+        float b0, b1;
+        star_visible = !(ptSphereRoots(pos_fovtan.xyz, rd,
+                                       planet_center_radius.xyz,
+                                       planet_center_radius.w, b0, b1)
+                         && b0 > 0.0);
+    }
+    if (!star_visible) return float3(0.0);
+    if (exposure_pad.z > 0.5) {
+        // BSC starmap (real Yale Bright Star Catalog, J2000 frame). Verbatim
+        // mirror of starsOnly()'s BSC branch minus the day fade.
+        float3 j;
+        j.x = dot(w2j_row0.xyz, rd);
+        j.y = dot(w2j_row1.xyz, rd);
+        j.z = dot(w2j_row2.xyz, rd);
+        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
+        if (u < 0.0) u += 1.0;
+        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
+        uint2 dim;
+        star_map.GetDimensions(dim.x, dim.y);
+        int xi = int(floor(u * float(dim.x))) % int(dim.x);
+        if (xi < 0) xi += int(dim.x);
+        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
+        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        if (exposure_pad.w > 0.001) {
+            int3 q  = int3(floor(j * 38.0));
+            uint qh = uint(q.x + 128) * 65536u
+                    + uint(q.y + 128) * 256u
+                    + uint(q.z + 128);
+            uint h    = pcgHash(qh + 0xb7e1u);
+            float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
+            uint h2   = pcgHash(h + 0xc0ffeeu);
+            float ph2 = float(h2 & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz_mult = 2.7 + float((h2 >> 16) & 0xFFu) * (2.6 / 256.0);
+            float speed = exposure_pad.w;
+            float fhz1 = fhz_base * speed;
+            float fhz2 = fhz_base * fhz_mult * speed;
+            float t   = float(frame_index) * (1.0 / 60.0);
+            float w   = 1.0
+                      + 0.30 * sin(6.28318530718 * (ph  + t * fhz1))
+                      + 0.15 * sin(6.28318530718 * (ph2 + t * fhz2));
+            stars *= w;
+        }
+        return stars;
+    } else if (exposure_pad.y > 0.5) {
+        float2 ll = float2(atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5,
+                           acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359));
+        ll *= float2(700.0, 350.0);
+        float2 cellI = floor(ll);
+        float2 cellF = ll - cellI;
+        float h  = frac(sin(dot(cellI, float2(127.1, 311.7))) * 43758.5453);
+        float h2 = frac(sin(dot(cellI, float2(269.5, 183.3)))  * 91842.1417);
+        if (h > 0.96) {
+            float2 starPos = float2(0.30 + h2 * 0.40,
+                                    0.30 + frac(h * 7.91) * 0.40);
+            float dist = length(cellF - starPos);
+            float brightness = pow(frac(h * 13.7), 4.0) * 4.0 + 0.5;
+            float intensity = brightness * exp(-dist * dist * 100.0);
+            float colorMix = frac(h * 5.31);
+            float3 hot  = float3(0.85, 0.92, 1.10);
+            float3 mid  = float3(1.00, 0.98, 0.95);
+            float3 cool = float3(1.05, 0.85, 0.70);
+            float3 starColor = (colorMix < 0.33) ? hot
+                              : (colorMix < 0.80) ? mid : cool;
+            return intensity * starColor;
+        }
+    }
+    return float3(0.0);
+}
+
 // Star contribution at a primary-miss direction, regardless of which
 // sky path is active. HDRI mode bakes stars into the env_map so we
 // return 0 there (the env_map is sampled at primary miss anyway; we
@@ -6722,6 +6836,22 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
     float bright = max(sun_extra2.x, 0.0);         // r_sun_disc_brightness
     return T * (kPtSolarIrradiance / max(omega, 1.0e-12)) * bright;
 }
+
+// Physical-mode star term (#333). The raw celestial radiance, extincted by the
+// real air column in front of it. sunSlantTransmittance(ro, rd) is a GENERIC
+// to-space Beer-Lambert transmittance along a direction -- it returns 0 when
+// the ray runs into the body (the same ptSphereRoots(planet_R) test
+// starsRadianceRaw uses for star_visible, so the two agree at the limb), 1
+// when the ray never touches the shell (space), and the reddened column
+// transmittance in between. It is not sun-specific; the name is historical.
+// skyColor() ADDS skyPhysical() on top of the value returned here -- that
+// additive in-scatter is what washes the stars out in daylight, so there is no
+// day/night flag here. See starsRadianceRaw() for the full rationale.
+float3 starsPhysical(float3 ro, float3 rd) {
+    float3 s = starsRadianceRaw(rd);
+    if (all(s <= float3(0.0))) return float3(0.0);
+    return s * sunSlantTransmittance(ro, rd);
+}
 // --- end Planetary P6 physical sky ------------------------------------------
 
 // `ro` is the ray's ORIGIN, and it is load-bearing only in mode 4
@@ -6743,8 +6873,15 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
     // as they do in the procedural and hosek modes, except that the sun
     // disc is the physical one.
     if (mode == 4u) {
+        // Stars via starsPhysical(): the celestial background extincted by the
+        // real air column, NOT faded by a sun-elevation flag. The daytime
+        // wash-out is the additive skyPhysical() term below burying the star
+        // flux; in space that term is ~0, so stars show against black even
+        // with the sun up. This is the "stars aren't there in space" fix
+        // (#333) -- starsOnly()'s `day` gate switched them off across the
+        // whole sunlit hemisphere of any orbit.
         return skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed)
-             + starsOnly(rd, sun_and_mode.xyz)
+             + starsPhysical(ro, rd)
              + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
              + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
     }
