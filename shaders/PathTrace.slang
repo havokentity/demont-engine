@@ -5777,264 +5777,12 @@ float3 sunIrradianceAt(float3 p, float3 sun_dir, float sun_elev) {
     return sun_col * (80.0 * kPtLegacySkyScale * trans_atm);
 }
 
-// --- Planetary P6 (#260): the sky that survives leaving ---------------------
-//
-// r_sky_mode physical.  Sky radiance is INTEGRATED along the view ray
-// rather than painted, and that single property is what makes the climb
-// from the surface to orbit continuous.
-//
-// WHY A FIFTH MODE AND NOT A FIX TO procSky
-//
-// procSky and hosekSky are analytic sky DOMES: functions of view
-// direction with the observer implicitly on the ground.  They are
-// accelerators for a ground observer, and good ones -- hosek in
-// particular is the genuine ArHosekSkyModel dataset.  Neither can leave.
-// procSky's zenith is the literal float3(0.32, 0.55, 0.92) at eye height
-// and the same literal at 400 km; hosek clamps cos_theta to [0, 1] and
-// fades its horizon, so it has no representation for "most of the sphere
-// is vacuum" at all.  Attempts to rescue them are all the same shape --
-// fade the painted dome out on altitude -- and a fade is a tuned
-// constant standing exactly where the discontinuity is.
-//
-// The physical mode has no accelerator to swap out, so there is no
-// crossover to hide.  At 1.7 m the chord through the shell is 100 km of
-// dense air and the integral is blue; at 400 km looking up the chord is
-// empty and the integral is zero, so the sky is black.  No fade, no
-// threshold, no cvar: it falls out of the geometry.  The roadmap
-// specifies a sky-view LUT gated on camera-inside-shell with a 10 km
-// cross-fade; direct evaluation everywhere is the same design with the
-// accelerator (and therefore the cross-fade, and therefore the tuning)
-// removed, which this engine can afford because it never rasterizes and
-// already marches per pixel.
-//
-// THE SAMPLE DISTRIBUTION IS ALTITUDE-INDEPENDENT, WHICH IS THE WHOLE
-// CONTINUITY ARGUMENT
-//
-// Uniform-in-distance stepping over [0, t] is catastrophic from orbit --
-// a nadir ray from 400 km is 400 km long and 90% of its optical depth is
-// in the last 20 km.  Stepping over the SHELL-CLIPPED interval instead
-// removes that failure without any stratification at all, because the
-// clipped interval always spans the same air whatever the camera's
-// altitude: a ground camera looking up and an orbital camera looking
-// down integrate the same 100 km column with the same N samples in the
-// same places.  The quadrature error is therefore a function of the
-// geometry of the ray and not of where the camera is, and an error that
-// does not move as the camera climbs cannot produce a pop.
-//
-// Samples are jittered (`(i + xi) * dt`), which makes this an unbiased
-// estimator of the integral rather than a fixed-point rule, so the
-// accumulator converges the residual quadrature error away over frames
-// instead of baking it in.
-//
-// WHAT IS IN THE INTEGRAL
-//
-//   L = integral over the shell chord of
-//         T(camera -> s) * [ sigma_s_R(h) P_R(mu) + sigma_s_M(h) P_CS(mu, g) ]
-//                        * L_sun * T(s -> sun)
-//
-// Three species from the body (#257), both real phase functions, and the
-// sun term is the same sunSlantTransmittance the NEE site and the cloud
-// march use -- so the light the sky is made of and the light the ground
-// is lit by cannot disagree.  T(s -> sun) returning zero when the body
-// occludes the sun IS the night side, and the terminator is the graded
-// region where it is partial: no elevation threshold anywhere.
-//
-// WHAT IS NOT IN IT, STATED RATHER THAN HIDDEN
-//
-//   * (RESOLVED in #280) MULTIPLE SCATTERING.  Was single-scatter only,
-//     which made the sky darker than reality -- most visibly at the
-//     zenith on a clear day and through twilight, where second-order
-//     Rayleigh is a large fraction of the total, and which is exactly
-//     what the retired r_rayleigh = 30 was standing in for.  Hillaire
-//     2020 section 4's 32x32 (r, mu_s) table now supplies it, built on
-//     the host into atmo_ms_lut.  Measured contribution at the zenith:
-//     +27% at noon, +63% at 4 degrees below the horizon.
-//   * (RESOLVED in #280) GROUND-REFLECTED LIGHT.  The multi-scatter
-//     table's build carries the planet-albedo bounce (r_sky_ground_albedo)
-//     into the isotropic term, so the ground does light the air above it
-//     -- at the order the table models, which is second and above.  The
-//     FIRST-order ground bounce along this particular view ray is still
-//     absent.
-//   * SCENE OCCLUSION of the sky column.  Terrain and clouds do not
-//     shadow this march; the analytic BODY does, via
-//     sunSlantTransmittance, and at planetary scale that is the term
-//     that matters.  The primary-HIT aerial-perspective march still uses
-//     transmittance(), so god rays through cloud gaps are unaffected.
-//
-// PRECONDITION: `rd` is unit length.  It is both the integration measure
-// and the s^2 coefficient of the hoisted altitude quadratic.
-float3 skyPhysical(float3 ro, float3 rd, float t_max, int steps,
-                   inout uint seed) {
-    float planet_R = sun_extra.w;
-    // The physical sky is a statement about a body.  Without one there is
-    // no shell to clip to and no horizon to occlude the sun, so the mode
-    // has nothing to integrate; the host refuses to select it in that
-    // state and this is the shader-side guard for the same condition.
-    if (planet_R <= 0.0) return float3(0.0);
-    PtAtmoBody body = atmosphereBody();
-    float3 pc = (planet_center_radius.w > 0.0) ? planet_center_radius.xyz
-                                               : float3(0.0, -planet_R, 0.0);
-    float t_in, t_out;
-    // r_inner = 0 so this is the near piece of the ray inside top_radius,
-    // correct for an origin below, inside or above the shell alike.
-    if (!ptRayShell(ro, rd, pc, 0.0, body.top_radius, t_max, t_in, t_out)) {
-        return float3(0.0);        // the ray never touches air -- space
-    }
-    // The body is opaque: stop the column where the ground starts.
-    float g0, g1;
-    if (ptSphereRoots(ro, rd, pc, planet_R, g0, g1) && g0 > 0.0) {
-        t_out = min(t_out, g0);
-    }
-    if (!(t_out > t_in)) return float3(0.0);
-
-    float3 sun_dir = sun_and_mode.xyz;
-    // Scattering angle.  Incident light propagates along -sun_dir and
-    // leaves toward -rd, so the phase cosine is dot(rd, sun_dir) -- the
-    // same convention the in-scatter march uses.
-    float mu   = dot(rd, sun_dir);
-    float ph_r = ptPhaseRayleigh(mu);
-    // The aerosol asymmetry comes from r_volumetric_anisotropy
-    // (vol_params.y, default 0.7) and NOT from the body's own mie_g, which
-    // ptAtmoEarth sets to the Cornette-Shanks 0.8.  Deliberate: the
-    // aerial-perspective march next door reads the same cvar, and the two
-    // meet at the limb, so a disagreement here would be a seam.  Honouring
-    // the user's knob in both is worth more than honouring the body's
-    // constant in one of them.  Unifying them is a change to the AP march
-    // as well, which moves clouds_godrays, so it belongs with that
-    // regeneration and not here.
-    float ph_m = ptPhaseCornetteShanks(mu, vol_params.y);
-
-    int   N  = max(steps, 1);
-    float dt = (t_out - t_in) / float(N);
-    float xi = randf(seed);
-    // Hoisted cancellation-free altitude (#271): the quadratic is
-    // accumulated once and each sample costs two fma, instead of
-    // materialising p(s) and subtracting two ~6.4e6 quantities.
-    PtRayAltitude alt = ptRayAltitudeBegin(ro, rd, pc, body.ground_radius);
-    float3 trans = float3(1.0);
-    float3 acc   = float3(0.0);
-    for (int i = 0; i < N; ++i) {
-        float s = t_in + (float(i) + xi) * dt;
-        if (s >= t_out) break;
-        float h = max(ptRayAltitudeAt(alt, s), 0.0);
-        float3 sigma_s_ray, sigma_s_mie, sigma_t;
-        ptAtmoCoefficients(body, h, sigma_s_ray, sigma_s_mie, sigma_t);
-        // Sunlight AT THIS SAMPLE.  Zero when the body is between the
-        // sample and the sun, which is what "night" means and needs no
-        // elevation gate; reddened by the real slant path, which is what
-        // the terminator and orbital sunrise are made of.
-        float3 sp     = ro + rd * s;
-        float3 sun_at = kPtSolarIrradiance * sunSlantTransmittance(sp, sun_dir);
-        if (any(sun_at > float3(0.0))) {
-            acc += trans * (sigma_s_ray * ph_r + sigma_s_mie * ph_m)
-                 * sun_at * dt;
-        }
-        // Second and higher orders (#280).  Isotropic, so it carries no
-        // phase function; the table already holds radiance with the solar
-        // irradiance folded in, so it multiplies the scattering
-        // coefficient and nothing else.  It is NOT inside the
-        // `any(sun_at > 0)` gate: a sample in the planet's shadow at
-        // twilight still receives multiply-scattered light from the lit
-        // air around it, and that is what the blue hour is made of.
-        float3 up_at   = normalize(sp - pc);
-        float3 ms_here = ptAtmoMultiScatter(body, length(sp - pc),
-                                            dot(up_at, sun_dir));
-        acc += trans * (sigma_s_ray + sigma_s_mie) * ms_here * dt;
-        trans *= exp(-sigma_t * dt);
-    }
-    // r_volumetric_intensity, the same artistic gain the in-scatter march
-    // applies, so the sky and the aerial perspective under it move
-    // together instead of drifting apart when a user turns it.
-    return acc * vol_params.z;
-}
-
-// The sun's own disc in the physical mode.
-//
-// Two things change from sunDisc().  The `sun_elev < -0.10` cutoff goes:
-// whether the sun is visible is whether the BODY is in the way, which
-// sunSlantTransmittance already answers exactly, and from outside the
-// atmosphere there is no elevation at which the sun should vanish.  And
-// the exp(-0.30 / max(sun_elev, 0.04)) attenuation with its hand-authored
-// warm/cool endpoint lerp goes: the disc's colour is the slant-path
-// transmittance, so the sun reddens through a real air mass on the way
-// down and is pure white from orbit, and orbital sunrise -- the sun
-// climbing out from behind the limb through a real grazing column --
-// costs nothing extra because it is the same expression.
-//
-// The halo goes too, and that is a deletion rather than a loss: the
-// bright bloom around a low sun is forward Mie scattering, which
-// skyPhysical now computes properly through the Cornette-Shanks phase at
-// g = 0.8.  Drawing the painted halo as well would double-count it.
-//
-// DISC RADIANCE IS DERIVED, NOT TUNED.  sunIrradianceAt returns E * T as
-// the solar irradiance, now in real W/m^2 (#280).  A disc of
-// solid angle Omega carrying irradiance E has radiance E / Omega, so the
-// rendered disc is E * T / Omega with Omega = 2 pi (1 - cos r) for the
-// rendered half-angle r.  Taking Omega from the RENDERED radius rather
-// than from the sun's true 0.2666 deg makes r_sun_size energy-conserving:
-// a bigger disc is proportionally dimmer and puts the same flux on the
-// scene, which is the property that stops the disc size from being a
-// brightness knob in disguise.
-float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
-    float3 T = sunSlantTransmittance(ro, sun_dir);
-    if (!any(T > float3(0.0))) return float3(0.0);   // body in the way
-    float ang = dot(rd, sun_dir);
-    // Same angular geometry as sunDisc: r_sun_size times the
-    // perihelion/aphelion ratio from the ephemeris (sun_extra.y).
-    float sun_mult = max(sun_extra.x * sun_extra.y, 0.1);
-    float r_deg    = 0.55 * sun_mult;
-    float r_rad    = r_deg * 0.0174533;
-    float kCosR    = cos(r_rad);
-    if (ang <= kCosR) return float3(0.0);
-
-    // Saemundsson horizon flatten (r_sun_horizon_flatten, sun_extra.z).
-    // Real refraction, kept -- but its trigger is the APPARENT elevation
-    // at the camera, which the host now derives from the camera's own
-    // local up rather than from the global sun.y.
-    float vflat = sun_extra.z;
-    if (vflat < 0.999) {
-        float3 world_up    = localUp(ro);
-        float3 local_right = normalize(cross(world_up, sun_dir));
-        float3 local_up    = cross(sun_dir, local_right);
-        float3 delta       = rd - sun_dir * ang;
-        float  h_off       = dot(delta, local_right);
-        float  v_off       = dot(delta, local_up);
-        float  r_v         = r_rad * vflat;
-        float  ellipse     = (h_off * h_off) / (r_rad * r_rad)
-                           + (v_off * v_off) / (r_v * r_v);
-        if (ellipse > 1.0) return float3(0.0);
-    }
-
-    float omega = 6.28318530718 * (1.0 - kCosR);   // sr, rendered disc
-    float bright = max(sun_extra2.x, 0.0);         // r_sun_disc_brightness
-    return T * (kPtSolarIrradiance / max(omega, 1.0e-12)) * bright;
-}
-// --- end Planetary P6 physical sky ------------------------------------------
-
-// `ro` is the ray's ORIGIN, and it is load-bearing only in mode 4
-// (planetary P6, #260).  procSky documents an approximation it has always
-// carried: it reads the CAMERA's altitude out of pos_fovtan even when a
-// secondary bounce called it, so a puddle at ground level under a 10 km
-// camera sees a 10 km horizon.  From orbit that error is 400 km.  The
-// physical mode takes the origin per call, so the approximation is simply
-// absent there -- every call site already has the right origin in scope
-// (the bounce's `ro`, or the surface point), it was never plumbed.  Modes
-// 0-3 ignore the parameter and are unchanged.
+// `ro` is the ray's ORIGIN. The sky domes (modes 0-3) ignore it -- they read
+// the camera altitude out of pos_fovtan -- so it is carried only so callers
+// have one signature; it was load-bearing only in the removed physical mode.
 float3 skyColor(float3 ro, float3 rd, inout uint seed) {
     float3 base;
     uint mode = uint(sun_and_mode.w);
-    // --- Planetary P6 (#260): mode == 4 -> physical, marched sky --------
-    // The only mode that survives leaving the atmosphere.  There is no
-    // painted base at all: the integral IS the sky, so it goes black
-    // outside the shell without a fade.  Celestials ride on top exactly
-    // as they do in the procedural and hosek modes, except that the sun
-    // disc is the physical one.
-    if (mode == 4u) {
-        return skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed)
-             + starsOnly(rd, sun_and_mode.xyz)
-             + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
-             + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
-    }
     // --- Wave 9 hosek-sky ---
     // mode == 3 -> Hosek-Wilkie physically-based sky. Routed like the
     // procedural path (mode 2): the analytic dome drives both the
@@ -6107,18 +5855,6 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
 // celestial overlays.
 float3 skyColorBase(float3 ro, float3 rd, inout uint seed) {
     uint mode = uint(sun_and_mode.w);
-    if (mode == 4u) {
-        // Physical mode (#260) carries no inline celestial term at all,
-        // so the base IS the march.  It runs at a QUARTER of the primary
-        // budget with a floor of 4: this tap is one sample of a diffuse
-        // hemispherical integral that the path tracer is already
-        // estimating stochastically, so its own quadrature error is
-        // averaged over the same accumulation the ambient term is -- the
-        // visible sky, which is not averaged over directions, is what
-        // needs the full budget.  A cost choice, stated as one.
-        return skyPhysical(ro, rd, 1.0e30,
-                           max(int(vol_params.w) / 4, 4), seed);
-    }
     if (mode == 3u) {
         // Hosek-Wilkie dome radiance carries no inline disc; skyColor
         // adds sunDisc/moonDisc on top, which is exactly what we skip.
@@ -6158,9 +5894,7 @@ float3 skyColorBase(float3 ro, float3 rd, inout uint seed) {
 float3 skyColorNoSunDisc(float3 ro, float3 rd, inout uint seed) {
     uint mode = uint(sun_and_mode.w);
     float3 s = skyColor(ro, rd, seed);
-    if (mode == 4u) {
-        s -= sunDiscPhysical(ro, rd, sun_and_mode.xyz);
-    } else if (mode == 3u) {
+    if (mode == 3u) {
         s -= sunDisc(rd, sun_and_mode.xyz);
     } else if (mode == 2u) {
         s -= sunDisc(rd, sun_and_mode.xyz)
@@ -6438,142 +6172,6 @@ OceanTexel oceanBilinearTexels(float2 uv, uint grid) {
     o.c11 = uint2(x1u, y1u);
     return o;
 }
-// --- Planetary P5 (#259): the cascade atlas --------------------------------
-// With more than one cascade the two ocean textures become an ATLAS: grid
-// wide, grid * cascade_count tall, cascade c occupying rows
-// [c*grid, (c+1)*grid). Wrapping stays WITHIN the cascade's band, which is
-// what oceanBilinearTexels' modulo already gives -- the row offset is added
-// afterwards so a v-wrap can never bleed into the neighbouring cascade.
-//
-// A single stacked atlas rather than one texture pair per cascade because
-// texture slots are the scarce resource here: PathTrace already saturates
-// Apple Silicon's 8-read_write compute cap and pbr_atlas is deliberately
-// declared last so it lands at MSL index 16 without moving anything. Three
-// cascades as six textures would need four more slots and would move that
-// assignment; as an atlas it needs none.
-OceanTexel oceanBilinearTexelsC(float2 uv, uint grid, uint c) {
-    OceanTexel o = oceanBilinearTexels(uv, grid);
-    uint row = c * grid;
-    o.c00.y += row; o.c10.y += row; o.c01.y += row; o.c11.y += row;
-    return o;
-}
-// --- #259 / #133 Phase 2: the march bracket, out of the atlas -------------
-//
-// oceanRayMarchShell brackets the wave band at R_sea +/- h_max, where
-// h_max is the SUM of the cascades' peak crests plus the host's slack.
-// It used to arrive as ocean_params0.w, which worked only while the host
-// solved the field: with shaders/OceanCascades.slang doing it the peak
-// exists only after the reduce pass, and pushing last frame's number would
-// put the bracket behind the field it brackets.
-//
-// So it travels in the displacement atlas, one row past the last cascade.
-// That row is unreachable by any sample: oceanBilinearTexelsC wraps modulo
-// `grid` INSIDE the cascade's band and only then adds c*grid, so the
-// largest y any fetch can form is (count-1)*grid + grid-1. Both solvers
-// write the identical float into the identical texel, so the shader reads
-// one number from one place whoever produced the field.
-float oceanShellHMax(uint count, uint grid) {
-    return ocean_displacement[uint2(0u, count * grid)].x;
-}
-float4 oceanFetchDispC(float2 uv, uint grid, uint c) {
-    OceanTexel o = oceanBilinearTexelsC(uv, grid, c);
-    float4 c00 = ocean_displacement[o.c00];
-    float4 c10 = ocean_displacement[o.c10];
-    float4 c01 = ocean_displacement[o.c01];
-    float4 c11 = ocean_displacement[o.c11];
-    return lerp(lerp(c00, c10, o.tx), lerp(c01, c11, o.tx), o.ty);
-}
-float4 oceanFetchNormalC(float2 uv, uint grid, uint c) {
-    OceanTexel o = oceanBilinearTexelsC(uv, grid, c);
-    float4 c00 = ocean_normal[o.c00];
-    float4 c10 = ocean_normal[o.c10];
-    float4 c01 = ocean_normal[o.c01];
-    float4 c11 = ocean_normal[o.c11];
-    return lerp(lerp(c00, c10, o.tx), lerp(c01, c11, o.tx), o.ty);
-}
-
-// Cascade c's tile period in metres. Packed into the .w lanes of the three
-// tangent-frame vectors rather than a fourth vec4 of its own.
-float oceanCascadePeriod(uint c) {
-    return (c == 0u) ? ocean_tan_e.w : ((c == 1u) ? ocean_tan_n.w
-                                                  : ocean_tan_o.w);
-}
-// Cascade c's tile-space phase. Cascade 0's is exactly zero: the anchor
-// lattice IS cascade 0's period, so the snap moves cascade 0 by a whole
-// number of tiles and its lookup is invariant by construction.
-float2 oceanCascadePhase(uint c) {
-    return (c == 0u) ? float2(0.0, 0.0)
-                     : ((c == 1u) ? ocean_phase.xy : ocean_phase.zw);
-}
-
-// --- Geometry-to-BRDF handover, Bruneton/Neyret/Holzschuch 2010 ------------
-//
-// How much of cascade c's slope variance a footprint of width `w` still
-// RESOLVES, in [0, 1]. Not a smoothstep: it is the Phillips equilibrium
-// range's own answer.
-//
-// In the equilibrium subrange the omnidirectional height spectrum goes as
-// k^-4 (Phillips 1958, "The equilibrium range in the spectrum of
-// wind-generated waves", J. Fluid Mech. 4(4) 426-434 -- and it is exactly
-// the k^-4 that OceanFFT's Phillips P(k) carries). The slope variance
-// integrand is then
-//
-//     k^2 * P(k) * k dk  ~  k^2 * k^-4 * k dk  =  dk / k  =  d(ln k),
-//
-// i.e. MEAN-SQUARE SLOPE IS UNIFORMLY DISTRIBUTED IN LOG WAVELENGTH. So
-// the fraction of a band [lo, hi] that survives a footprint w is just the
-// log-length of the part of the band above w:
-//
-//     g_c(w) = ln(hi / clamp(w, lo, hi)) / ln(hi / lo).
-//
-// One log per cascade, no tuned constant, and it is 1 at w <= lo and 0 at
-// w >= hi exactly rather than asymptotically.
-//
-// The band edges are the partition the host built the cascades on: cascade
-// c owns wavelengths from the NEXT finer cascade's period up to its own,
-// and the finest cascade bottoms out at its own Nyquist (2 * grid spacing).
-// kOceanBandDivisor MIRRORS Engine.h's constant of the same name: how many
-// periods of its longest wave a cascade's tile holds. Cascade 0 is
-// unbounded above, so its band top is its own tile period.
-static const float kOceanBandDivisor = 8.0;
-float oceanCascadeResolved(uint c, uint count, uint grid, float w) {
-    float P  = oceanCascadePeriod(c);
-    float hi = (c == 0u) ? P : (P / kOceanBandDivisor);
-    float lo = (c + 1u < count)
-                   ? (oceanCascadePeriod(c + 1u) / kOceanBandDivisor)
-                   : (2.0 * P / float(max(grid, 1u)));
-    if (!(hi > lo)) return 1.0;
-    float wc = clamp(w, lo, hi);
-    return log(hi / wc) / log(hi / lo);
-}
-// The three weights at once. Computed ONCE per ray, not per march step --
-// the ray cone is constant over a hit.
-float3 oceanCascadeResolvedAll(uint count, uint grid, float w) {
-    float3 g = float3(0.0, 0.0, 0.0);
-    if (count > 0u) g.x = oceanCascadeResolved(0u, count, grid, w);
-    if (count > 1u) g.y = oceanCascadeResolved(1u, count, grid, w);
-    if (count > 2u) g.z = oceanCascadeResolved(2u, count, grid, w);
-    return g;
-}
-
-// The microfacet alpha^2 the water surface needs at this footprint.
-//
-// The whole handover is one conservation statement:
-//
-//     sigma^2_geometry(w) + alpha^2_brdf(w) = sigma^2_CoxMunk    for all w
-//
-// Geometry carries what the cascades still resolve; the BRDF carries the
-// rest. Nothing fades, nothing is tuned, and the total is a MEASURED
-// oceanographic constant (Cox & Munk 1954; see src/physics/OceanFFT.h for
-// the alpha^2 = mean-square-slope derivation). At the boat the cascades
-// carry almost all of it and the surface is a near-mirror; from orbit they
-// carry none and alpha^2 is exactly Cox-Munk's sigma^2. There is no
-// altitude anywhere in the expression -- only the cone.
-float oceanBrdfAlpha2(float3 resolved) {
-    float geom = dot(resolved, ocean_slope.xyz);
-    return max(ocean_slope.w + planet_ocean.z - geom, 0.0);
-}
-
 float4 oceanFetchDisp(float2 uv, uint grid) {
     OceanTexel o = oceanBilinearTexels(uv, grid);
     float4 c00 = ocean_displacement[o.c00];
@@ -6637,86 +6235,6 @@ struct OceanHit {
     float3 normal;     // FFT surface normal at the hit
     float  foam;       // foam coverage [0,1] at the hit
 };
-
-// --- Planetary P5 (#259): the camera-anchored tangent frame ---------------
-//
-// The FFT tile is intrinsically planar; the ocean is not. The parameterisation
-// is an orthographic projection into the East/North basis at ONE anchor point
-// on the shell, which the host recomputes each frame:
-//
-//     (e, n) = ( dot(p - O, East), dot(p - O, North) ),   metres.
-//
-// Distortion is second order in (d/R)^2 -- at d = 100 km that is 2.5e-4, i.e.
-// 25 m of arc-length error over 100 km, on a field whose finest cascade tiles
-// every 23 m and whose crests are sub-pixel past ~1.4 km anyway.
-//
-// WHY THE ANCHOR IS QUANTISED. A tangent origin that slides with the camera
-// drags the wave field along with it and deletes parallax -- the sea would
-// look painted on. The host snaps the anchor to a lattice whose spacing is
-// exactly cascade 0's period, so the snap translates the field by a whole
-// number of cascade-0 tiles and cascade 0's lookup does not move at all.
-// Cascades 1 and 2 pick up a phase, which the host computes in f64 from the
-// integer lattice indices and pushes -- a pure function of camera position,
-// with no hysteresis, which is what the golden matrix requires.
-//
-// WHY THIS FIXES THE ABSOLUTE-XZ BUG TOO. The Wave 8 UV was
-// `float2(world_p.x, world_p.z) / tile`; at an ECEF x of 6.4e6 over a 50 m
-// tile that is 128 000, and frac() of it retains almost no sub-tile
-// precision. Here the projection is taken against an anchor a few hundred km
-// away at worst, and the integer tile offset travels separately in
-// ocean_phase, so the mantissa is spent on the fractional part.
-float2 oceanTangentEN(float3 p) {
-    float3 d = p - ocean_tan_o.xyz;
-    return float2(dot(d, ocean_tan_e.xyz), dot(d, ocean_tan_n.xyz));
-}
-
-// The summed cascade field at a point. `amp` is sqrt of each cascade's
-// resolved-variance weight: scaling a cascade's amplitude by a scales its
-// slope variance by a^2, so sqrt is what makes the variance bookkeeping in
-// oceanBrdfAlpha2 exact rather than approximate.
-struct OceanCascadeSample {
-    float  height;     // summed vertical displacement, metres
-    float2 slope;      // summed (dh/dEast, dh/dNorth)
-    float  foam;
-};
-OceanCascadeSample oceanSampleCascades(float2 en, uint count, uint grid,
-                                       float3 amp) {
-    OceanCascadeSample s;
-    s.height = 0.0; s.slope = float2(0.0, 0.0); s.foam = 0.0;
-    [unroll]
-    for (uint c = 0u; c < 3u; ++c) {
-        if (c >= count) break;
-        float a = (c == 0u) ? amp.x : ((c == 1u) ? amp.y : amp.z);
-        if (a <= 0.0) continue;
-        float2 uv = en / max(oceanCascadePeriod(c), 1e-3) + oceanCascadePhase(c);
-        float4 d = oceanFetchDispC(uv, grid, c);
-        float4 n = oceanFetchNormalC(uv, grid, c);
-        s.height += a * d.y;
-        // Recover the slope the packed unit normal encodes. The solver
-        // builds it as normalize(-dh/dx, 1, -dh/dz), so the inverse is
-        // exact. Slopes ADD across cascades; unit normals do not, which is
-        // why the sum happens here and the normalise happens once at the
-        // end.
-        float ny = max(n.y, 1e-4);
-        s.slope += a * float2(-n.x / ny, -n.z / ny);
-        s.foam = max(s.foam, a * d.w);
-    }
-    return s;
-}
-
-// Height of the displaced sea surface above the shell, at a point, in
-// metres. The band the march brackets is +/- ocean_params0.w about
-// planet_ocean.x.
-float oceanShellHeightAt(float3 p, uint count, uint grid, float3 amp) {
-    return oceanSampleCascades(oceanTangentEN(p), count, grid, amp).height;
-}
-
-// World-space surface normal from the summed cascade slopes. `up`, `east`
-// and `north` are the tangent frame; the slopes are expressed in it.
-float3 oceanShellNormal(float2 slope, float3 up) {
-    float3 n = up - slope.x * ocean_tan_e.xyz - slope.y * ocean_tan_n.xyz;
-    return normalize(n);
-}
 
 // Ray-march the FFT ocean heightfield starting from (and bounded by) the
 // analytic water-plane intersection. Standard relief-mapping linear search +
@@ -6821,119 +6339,6 @@ OceanHit oceanRayMarch(float3 ro, float3 rd, float3 plane_n,
     return oh;
 }
 
-// --- Planetary P5 (#259): the radial march --------------------------------
-//
-// The same relief march, with "above the plane" replaced by "outside the
-// shell". Three things change and one thing deliberately does not.
-//
-//  * The band is two SHELL intersections at R_sea +/- h_max rather than two
-//    y-plane solves, via ptRayShell -- which carves the inner sphere out of
-//    the outer one, so the returned interval is the near band crossing for a
-//    ray coming down AND the upward band crossing for a submerged ray, with
-//    no case analysis here.
-//  * `p.y` becomes ptRayAltitudeAt: the cancellation-free altitude above the
-//    shell, HOISTED along the ray. Materialising ro + rd*s and taking its
-//    altitude would cap the march at ULP(|p|) ~ 0.5 m in any frame whose
-//    origin is not near the surface -- against a 1.5 m wave.
-//  * The crossing test is oceanCrossed, so a submerged ray looking up finds
-//    the surface.
-//
-// AND THE GRAZING BAILOUT STAYS, and matters more here, not less: on a
-// planet every horizon ray is grazing. Its criterion is now derived rather
-// than an absolute 1e-3 on rd.y -- march the crests only while the band is
-// wider than the pixel. 2*h_max <= cone_width is exactly the study's
-// "displacement is sub-pixel beyond 1.4 km" bound written as the comparison
-// it actually is (2 * 1.5 m / 1.07e-3 rad = 2.8 km at 60 deg / 1080p), and
-// it degrades correctly at every resolution and field of view instead of at
-// the one they were measured on. Past it the analytic shell IS the surface
-// and only oceanBrdfAlpha2's roughness matters.
-OceanHit oceanRayMarchShell(float3 ro, float3 rd, float3 shell_n,
-                            float shell_t, float cone_w, int max_steps,
-                            float3 resolved) {
-    OceanHit oh;
-    oh.hit = false; oh.t = shell_t;
-    oh.normal = shell_n; oh.foam = 0.0;
-
-    float R     = planet_ocean.x;
-    float3 pc   = planet_center_radius.xyz;
-    uint  grid  = uint(max(ocean_params1.y, 1.0));
-    uint  count = uint(max(planet_ocean.y, 1.0));
-    float h_max = max(oceanShellHMax(count, grid), 0.01);
-    float3 amp  = sqrt(max(resolved, float3(0.0, 0.0, 0.0)));
-
-    // Sub-pixel crests: take the shell, fetch the cascade normal there.
-    // Note this is the FULL-amplitude normal at that point -- the roughness
-    // fold has already removed the unresolved part from `amp`.
-    if (2.0 * h_max <= cone_w) {
-        float3 pp = ro + rd * shell_t;
-        OceanCascadeSample s = oceanSampleCascades(oceanTangentEN(pp), count,
-                                                   grid, amp);
-        oh.normal = oceanShellNormal(s.slope, shell_n);
-        oh.foam   = s.foam;
-        oh.t      = shell_t;
-        oh.hit    = true;
-        return oh;
-    }
-
-    float t_in, t_out;
-    if (!ptRayShell(ro, rd, pc, R - h_max, R + h_max, shell_t + h_max * 4.0,
-                    t_in, t_out) || !(t_out > t_in)) {
-        // Degenerate band (a ray that only clips the shell tangentially, or
-        // one whose whole band lies behind it): take the analytic shell.
-        float3 pp = ro + rd * shell_t;
-        OceanCascadeSample s = oceanSampleCascades(oceanTangentEN(pp), count,
-                                                   grid, amp);
-        oh.normal = oceanShellNormal(s.slope, shell_n);
-        oh.foam   = s.foam;
-        oh.t      = shell_t;
-        oh.hit    = true;
-        return oh;
-    }
-
-    int steps = clamp(max_steps, 8, 256);
-    float dt  = (t_out - t_in) / float(steps);
-
-    // Hoisted altitude: |p(s) - c|^2 - R^2 is a quadratic in s whose two
-    // coefficients are constant along the ray, so the accumulator is paid
-    // once and each step costs two fma. See ptRayAltitudeBegin.
-    PtRayAltitude alt = ptRayAltitudeBegin(ro, rd, pc, R);
-
-    float t_prev = t_in;
-    float3 p_prev = ro + rd * t_prev;
-    // diff > 0 means the ray point is OUTSIDE the displaced surface.
-    float diff_prev = ptRayAltitudeAt(alt, t_prev)
-                    - oceanShellHeightAt(p_prev, count, grid, amp);
-
-    bool found = false;
-    float t_hit = shell_t;
-    [loop]
-    for (int i = 1; i <= steps; ++i) {
-        float t_cur = t_in + dt * float(i);
-        float3 p_cur = ro + rd * t_cur;
-        float diff_cur = ptRayAltitudeAt(alt, t_cur)
-                       - oceanShellHeightAt(p_cur, count, grid, amp);
-        if (oceanCrossed(diff_prev, diff_cur)) {
-            float w = diff_prev / oceanSecantDenom(diff_prev, diff_cur);
-            t_hit = lerp(t_prev, t_cur, w);
-            found = true;
-            break;
-        }
-        t_prev = t_cur;
-        diff_prev = diff_cur;
-    }
-    if (!found) t_hit = shell_t;
-
-    float3 ph = ro + rd * t_hit;
-    OceanCascadeSample s = oceanSampleCascades(oceanTangentEN(ph), count,
-                                               grid, amp);
-    // The macro normal is the local vertical AT THE HIT, not at the shell
-    // entry: over a several-km band traverse those differ by the arc.
-    oh.normal = oceanShellNormal(s.slope, localUp(ph));
-    oh.foam   = s.foam;
-    oh.t      = t_hit;
-    oh.hit    = true;
-    return oh;
-}
 #endif  // PT_WATER_ENABLED
 // --- end Water Phase 1 -----------------------------------------------------
 
@@ -6976,27 +6381,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // where the shading pass renders waves). Same gate + march as the
         // shading pass above.
 #if PT_WATER_ENABLED
-        // Planetary P5 (#259): the "is this surface horizontal enough for a
-        // heightfield march" gate is dot(n, localUp) rather than n.y. In the
-        // planar frame localUp() is float3(0,1,0) and the dot IS n.y bit for
-        // bit, so every pre-P5 scene takes the identical branch.
+        // The "is this surface horizontal enough for a heightfield march"
+        // gate is dot(n, localUp); localUp() is float3(0,1,0) here so the dot
+        // is n.y bit for bit.
         if (ocean_params0.x != 0.0 && h0.hit && h0.mat == MAT_WATER &&
             abs(dot(h0.normal, localUp(ro0 + rd0 * h0.t))) > 0.5) {
-            if (planet_ocean.x > 0.0) {
-                float3 res0 = oceanCascadeResolvedAll(
-                    uint(max(planet_ocean.y, 1.0)),
-                    uint(max(ocean_params1.y, 1.0)),
-                    ptConeWidthAt(cone0, h0.t));
-                OceanHit oo0 = oceanRayMarchShell(ro0, rd0, h0.normal, h0.t,
-                                                  ptConeWidthAt(cone0, h0.t),
-                                                  int(ocean_params1.x), res0);
-                if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
-            } else {
-                float plane_y0 = (ro0 + rd0 * h0.t).y;
-                OceanHit oo0 = oceanRayMarch(ro0, rd0, h0.normal, plane_y0, h0.t,
-                                             int(ocean_params1.x));
-                if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
-            }
+            float plane_y0 = (ro0 + rd0 * h0.t).y;
+            OceanHit oo0 = oceanRayMarch(ro0, rd0, h0.normal, plane_y0, h0.t,
+                                         int(ocean_params1.x));
+            if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
         }
 #endif
 
@@ -7568,42 +6961,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // perspective, Beer's-law segment, and shading uniformly. h.albedo's
         // alpha carries the per-hit foam coverage for the BRDF branch.
         float ocean_foam_here = 0.0;
-        // Planetary P5 (#259): the microfacet alpha^2 the sub-footprint wave
-        // slope contributes at THIS hit. Zero everywhere except a planetary
-        // ocean hit, and the water BRDF's rough branch is gated on it being
-        // positive, so every pre-P5 water surface keeps its mirror path.
+        // The microfacet alpha^2 the sub-footprint wave slope would add at a
+        // planetary-ocean hit. Held at 0 for the game water, and the water
+        // BRDF's rough branch is gated on it being positive, so every
+        // MAT_WATER surface keeps its mirror path.
         float ocean_alpha2_here = 0.0;
 #if PT_WATER_ENABLED
-        if (planet_ocean.x > 0.0 && h.hit && h.mat == MAT_WATER) {
-            // Planetary P5 (#259). The roughness fold is NOT gated on the
-            // FFT being on, and that is what makes the acceptance test
-            // possible rather than merely plausible: with r_ocean 0 the
-            // cascades resolve nothing, so alpha^2 is Cox & Munk's sigma^2
-            // at every distance and the shell is the smooth glitter sphere a
-            // wave field seen from far enough away IS. Turning r_ocean on
-            // must not change what the frame looks like from 400 km -- the
-            // two halves of the same conservation law.
-            float ocean_cone_w = ptConeWidthAt(cone, h.t);
-            float3 res = float3(0.0, 0.0, 0.0);
-            if (ocean_params0.x != 0.0) {
-                res = oceanCascadeResolvedAll(uint(max(planet_ocean.y, 1.0)),
-                                              uint(max(ocean_params1.y, 1.0)),
-                                              ocean_cone_w);
-            }
-            ocean_alpha2_here = oceanBrdfAlpha2(res);
-            if (ocean_params0.x != 0.0 &&
-                abs(dot(h.normal, localUp(ro + rd * h.t))) > 0.5) {
-                OceanHit oo = oceanRayMarchShell(ro, rd, h.normal, h.t,
-                                                 ocean_cone_w,
-                                                 int(ocean_params1.x), res);
-                if (oo.hit) {
-                    h.t = oo.t;
-                    h.normal = oo.normal;
-                    ocean_foam_here = oo.foam;
-                }
-            }
-        } else if (ocean_params0.x != 0.0 && h.hit && h.mat == MAT_WATER &&
-                   abs(dot(h.normal, localUp(ro + rd * h.t))) > 0.5) {
+        if (ocean_params0.x != 0.0 && h.hit && h.mat == MAT_WATER &&
+            abs(dot(h.normal, localUp(ro + rd * h.t))) > 0.5) {
             float plane_y = (ro + rd * h.t).y;   // analytic plane height
             OceanHit oo = oceanRayMarch(ro, rd, h.normal, plane_y, h.t,
                                         int(ocean_params1.x));
@@ -9213,92 +8578,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // camera-to-surface air, and that is where aerial perspective
             // comes from.
             if (uint(sun_and_mode.w) == 2u && !primary_hit) march_ray = false;
-            // --- Planetary P6 (#260): the span, and who owns it ------------
-            //
-            // In the physical sky mode a primary MISS has already had its
-            // entire column integrated by skyPhysical at the miss site, so
-            // marching it again here would double-count it. A primary HIT
-            // has not: nothing else integrates camera-to-surface air, and
-            // this march is where aerial perspective comes from.
-            //
-            // For a hit, the 60 km cap has to go. It was a sensible bound
-            // for a ground camera -- Rayleigh's 8 km scale height puts
-            // almost everything in the bottom 25 km -- but from 400 km
-            // looking down, the FIRST 60 km of the ray is vacuum and the
-            // air is in the last 100. Capping there gives the surface
-            // extinction with no in-scatter at all, so the planet reads as
-            // a dark body with no haze over it: the same failure as the
-            // black disc, one term further along.
-            //
-            // The replacement is not a bigger number. It is the shell clip
-            // (ptRayShell against the body's own top_radius), which spends
-            // the same N samples on the air wherever the camera is -- the
-            // property that makes the in-scatter continuous across the
-            // climb for exactly the reason skyPhysical's own march is.
-            //
-            // The legacy modes keep min(primary_t, 60000) bit-for-bit.
-            uint sky_mode_v = uint(sun_and_mode.w);
-            bool physical_sky_v = (sky_mode_v == 4u);
+            // Aerial-perspective span: the near piece of the ray, capped at
+            // 60 km (Rayleigh's 8 km scale height puts almost everything in
+            // the bottom 25 km) or at the primary hit, whichever is nearer.
             float t_near_v = 0.0;
             float t_far_v  = min(primary_t, 60000.0);
-            bool span_ok_v = true;
-            if (physical_sky_v) {
-                if (primary_hit) {
-                    float planet_R_v = sun_extra.w;
-                    float3 pc_v = (planet_center_radius.w > 0.0)
-                                ? planet_center_radius.xyz
-                                : float3(0.0, -planet_R_v, 0.0);
-                    span_ok_v = (planet_R_v > 0.0)
-                             && ptRayShell(primary_ro, primary_rd, pc_v, 0.0,
-                                           ptAtmoEarth(planet_R_v).top_radius,
-                                           primary_t, t_near_v, t_far_v);
-                    // AND STOP THE COLUMN AT THE GROUND (#300 follow-up).
-                    // skyPhysical has carried this clamp since #260 -- see
-                    // "The body is opaque" next to its own ptRayShell call
-                    // -- and this march did not, which made the two
-                    // disagree about where the air ends for exactly the
-                    // rays that hit the body.
-                    //
-                    // It bites whenever the primary hit is BELOW the
-                    // atmosphere's datum, and with streamed terrain that is
-                    // every pixel of the disc: the datum is the site's
-                    // geocentric radius while P3's analytic backstop is
-                    // WGS-84 b - 10 935 - 65 m, 27.7 km lower at the 27.99 N
-                    // site. Those 27.7 km were marched with the altitude
-                    // clamped to 0, i.e. as a slab of SEA-LEVEL air, and
-                    // being in-scatter it ADDED light rather than removing
-                    // it. Measured at nadir, sub-solar: the slab contributes
-                    // sigma_s(0) * 27.7 km * P_R(-1) * E = (7.4, 21.6, 54.4)
-                    // W/m^2/sr against a true column in-scatter of
-                    // (2.1, 6.2, 15.7) -- four times the real atmosphere,
-                    // which is what washed the land cover off the disc.
-                    //
-                    // Same defect as the one ptAtmoOpticalDepth carries on
-                    // the extinction side, and the same fix: the medium has
-                    // a floor.
-                    //
-                    // WHY NO IMAGE GOLDEN MOVES, AND WHY THAT IS THE
-                    // POINT. Every fixture with r_sky_mode physical has
-                    // r_planet_terrain 0, and without terrain the analytic
-                    // body sits AT the datum (Engine.cpp only lowers it to
-                    // the backstop when terrain is on), so this clamp is a
-                    // no-op on all nine of them -- verified: the whole
-                    // matrix is bit-stable across this change. That is
-                    // exactly the gap the defect lived in. Until a cell
-                    // combines the two, the guard is the source pin in
-                    // tests/pt_atmosphere_test.cpp, not a picture.
-                    float g0_v, g1_v;
-                    if (span_ok_v
-                        && ptSphereRoots(primary_ro, primary_rd, pc_v,
-                                         planet_R_v, g0_v, g1_v)
-                        && g0_v > 0.0) {
-                        t_far_v = min(t_far_v, g0_v);
-                        span_ok_v = (t_far_v > t_near_v);
-                    }
-                } else {
-                    span_ok_v = false;   // skyPhysical already did this ray
-                }
-            }
+            bool  span_ok_v = true;
             if ((march_mie || march_ray) && span_ok_v) {
                 float  t_far   = t_far_v;
                 float  dt      = (t_far - t_near_v) / float(N);
@@ -9313,20 +8598,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 float  jitter  = randf(seed);
                 float3 trans_eye = float3(1.0);
                 float3 v_color = float3(0.0);
-                // Aerosol phase. The legacy modes keep plain
-                // Henyey-Greenstein, bit-for-bit. The physical mode uses
-                // Cornette-Shanks -- the same helper skyPhysical uses --
-                // because the two marches meet at the horizon: one pixel
-                // hits the body and gets its in-scatter from here, the
-                // pixel above it misses and gets it from skyPhysical, and
-                // if they disagreed about the phase function there would
-                // be a seam along the limb. The two differ by up to 2x
-                // (CS/HG = 3(1 + mu^2) / (2(2 + g^2)), which is 0.60 at
-                // mu = 0 and 1.20 at mu = 1 for g = 0.7), so the seam
-                // would be plainly visible.
-                float phase_mie_v = physical_sky_v
-                                  ? ptPhaseCornetteShanks(cos_theta, g)
-                                  : phase;
+                // Aerosol phase: plain Henyey-Greenstein, bit-for-bit.
+                float phase_mie_v = phase;
                 // Identical math to the (3/(16 pi))(1 + mu^2) literal this
                 // replaces; routed through the shared helper so the sky
                 // modes and the haze march cannot drift apart.
