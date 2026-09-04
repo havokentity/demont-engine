@@ -34,13 +34,13 @@ namespace pt::rhi {
 //
 //     D >= kMaxFramesInFlight + 1.
 //
-// Engine::kOceanUploadRing (3) and PlanetTerrain::kRetireFrames (3) are both
-// D = 3, so kMaxFramesInFlight = 2 -- which is the depth VulkanDevice has
-// enforced with its fence ring since it was written. MEASURED consequence of
-// Metal NOT enforcing it (#295): golden_planet_ocean_snell rendered a
-// different image in 2 runs out of 10, and the outlier correlated one-for-one
-// with the frame at which the Metal backend had FOUR command buffers still
-// in flight -- one more than the ocean ring's three slots can absorb.
+// Engine::kOceanUploadRing (3) is D = 3, so kMaxFramesInFlight = 2 -- which is
+// the depth VulkanDevice has enforced with its fence ring since it was written.
+// MEASURED consequence of Metal NOT enforcing it (#295): an ocean fixture
+// rendered a different image in 2 runs out of 10, and the outlier correlated
+// one-for-one with the frame at which the Metal backend had FOUR command
+// buffers still in flight -- one more than the ocean ring's three slots can
+// absorb.
 //
 // Raising this constant requires raising every ring above with it.
 inline constexpr int kMaxFramesInFlight = 2;

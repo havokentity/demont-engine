@@ -1240,69 +1240,26 @@ cbuffer Push {
     // SPIR-V Frame block below + Engine.cpp PtPush.
     float4 planet_center_radius;
     // --- end Planetary P0 -----------------------------------------------------
-    // --- Planetary P3 (#257): the analytic planet body ------------------------
-    // .xyz = ground albedo, .w = the body's radius in metres, or 0 when the
-    // body is off. Kept as its own lane rather than folded into
-    // planet_center_radius because that field's .w is the ATMOSPHERE shell's
-    // radius and is what every altitude query in the shader is measured
-    // against -- a scene may legitimately have air and no ground body (every
-    // fixture that exists today does), and conflating the two would make
-    // "is the ground on?" and "is the frame spherical?" the same question.
-    //
-    // 16 B appended at the very tail so every existing field offset is
-    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    // --- RESERVED: analytic planet body (#257, removed) -----------------------
+    // Fed the removed analytic planet body. Held at zero by the host and read
+    // by no shader path; kept at the tail so the push layout is unchanged and
+    // still mirrors the SPIR-V Frame block below + Engine.cpp PtPush.
     float4 planet_ground;
-    // --- end Planetary P3 -----------------------------------------------------
-    // --- Planetary P4 (#258): terrain runtime state ---------------------------
-    // .x = snowline altitude in metres at this scene's reference site. A
-    //      SHADING parameter, not a physical model: the regional snowline is
-    //      ~4 900 m in the tropics (Kaser & Osmaston, "Tropical Glaciers",
-    //      2002) and drops toward sea level at high latitude, and the engine
-    //      scales that anchor by cos(site latitude). Never touches geometry.
-    // .y = number of live TLAS instances (informational / debug overlay).
-    // .z = 1 when terrain streaming is active this frame, 0 otherwise.
-    // .w = reserved.
-    //
-    // 16 B appended at the very tail so every existing field offset is
-    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    // --- RESERVED: terrain runtime state (#258, removed) ----------------------
+    // Fed the removed streamed terrain. Held at zero; layout-preserving.
     float4 planet_terrain;
-    // --- end Planetary P4 -----------------------------------------------------
-    // --- Planetary P5 (#259): the planetary ocean -----------------------------
-    // Six vec4s appended at the tail so every existing field offset is
-    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
-    //
-    //   planet_ocean.x = SEA-LEVEL RADIUS in metres, 0 = no planetary ocean.
-    //                    The host fills it from the SAME radius that fills
-    //                    planet_center_radius.w, for the reason P3 gives
-    //                    about the air and the ground: two copies of "where
-    //                    is sea level" disagree, and a disagreement between
-    //                    the ocean and the terrain is a coastline in the
-    //                    wrong place.
-    //   planet_ocean.y = number of FFT cascades stacked in the ocean texture
-    //                    atlas (1 = the legacy single-tile layout).
-    //   planet_ocean.z = Cox & Munk 1954 total mean-square slope for this
-    //                    wind speed. The value the BRDF must converge to as
-    //                    the ray-cone footprint outgrows every cascade.
-    //   planet_ocean.w = reserved.
-    //
-    //   ocean_tan_e.xyz = tangent-frame EAST basis (unit, render space)
-    //   ocean_tan_n.xyz = tangent-frame NORTH basis (unit, render space)
-    //   ocean_tan_o.xyz = tangent-frame ORIGIN, render-relative, on the shell
-    //   ocean_tan_{e,n,o}.w = cascade 0 / 1 / 2 tile period in metres
-    //   ocean_phase.xy  = cascade 1 tile-space phase, .zw = cascade 2's.
-    //                     Cascade 0's is 0 by construction -- the anchor
-    //                     lattice IS cascade 0's period.
-    //   ocean_slope.xyz = each cascade's own total mean-square slope
-    //   ocean_slope.w   = alpha^2 of the water microsurface below every
-    //                     cascade (0: clean water has no roughness of its
-    //                     own, all of it is wave slope).
+    // --- RESERVED: planetary ocean (#259, removed) ----------------------------
+    // These six vec4 lanes fed the removed planetary ocean cascades. Kept at
+    // the tail so every existing field offset is untouched and the push layout
+    // matches Engine.cpp's PtPush byte for byte; the host now holds them at
+    // zero and no shader path reads them.
     float4 planet_ocean;
     float4 ocean_tan_e;
     float4 ocean_tan_n;
     float4 ocean_tan_o;
     float4 ocean_phase;
     float4 ocean_slope;
-    // --- end Planetary P5 -----------------------------------------------------
+    // --- end reserved ---------------------------------------------------------
     // --- Planetary P7 (#261): underwater in-scatter ------------------------
     //
     // water_scatter.xyz = the MOLECULAR scattering coefficient of pure
@@ -1352,43 +1309,15 @@ cbuffer Push {
     float4 sky_cook_horizon_sun;
     float4 sky_cook_horizon_anti;
     // --- end #280 -------------------------------------------------------------
-    // --- Land cover (#300): the site's ECEF basis + the raster's shape --------
-    //
-    // WHY A BASIS AND NOT A LATITUDE. A raster indexed by geodetic
-    // (lat, lon) needs the SHADED POINT's coordinates, and the engine's
-    // world frame is a local East / Up / South frame pinned at the scene's
-    // site (PlanetSite::ecef_to_world, src/renderer/Planet/TerrainChunk.h).
-    // Handing the shader the site's latitude -- which is what
-    // planet_terrain.x used to carry, folded into a cos() -- gives one
-    // number for the whole planet, so a globe seen from orbit had one
-    // snowline and could not have had a raster at all. These three rows are
-    // the rotation that turns a world-space radial direction back into ECEF,
-    // where latitude and longitude exist.
-    //
-    //   land_basis_e.xyz = the East  row of PlanetSite::ecef_to_world
-    //   land_basis_u.xyz = the Up    row  (geocentric, not geodetic -- see
-    //                                     TerrainChunk.h on why the centre
-    //                                     is geocentric)
-    //   land_basis_s.xyz = the South row
-    //
-    // so ecef = E*w.x + U*w.y + S*w.z for a world-space vector w, which is
-    // transpose(ecef_to_world) * w written out.
-    //
-    //   land_basis_e.w = raster width  in texels, 0 = NO RASTER BOUND. The
-    //                    single gate: with 0 here the terrain falls to
-    //                    terrainProceduralAlbedo() and land_albedo is never
-    //                    read, which is what makes the placeholder binding
-    //                    safe.
-    //   land_basis_u.w = raster height in texels.
-    //   land_basis_s.w = r_planet_land_albedo, the master blend from the
-    //                    procedural classification (0) to the raster (1).
-    //
-    // Three vec4 appended at the very tail so every existing field offset is
-    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    // --- RESERVED: land-cover ECEF basis (#300, removed) ----------------------
+    // Fed the removed land-cover raster (the site's East/Up/South ECEF basis
+    // and the raster shape). Held at zero by the host and read by no shader
+    // path; kept at the tail so the push layout is unchanged and still mirrors
+    // the SPIR-V Frame block below + Engine.cpp PtPush.
     float4 land_basis_e;
     float4 land_basis_u;
     float4 land_basis_s;
-    // --- end land cover -------------------------------------------------------
+    // --- end reserved ---------------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -5739,8 +5668,7 @@ float3 sunSlantTransmittance(float3 p, float3 sun_dir) {
 // the name and the comment named different quantities and the caller could
 // not tell which the code meant.  The arithmetic was never ambiguous: every
 // call site multiplies this by a BRDF and a cosine with no solid angle
-// anywhere, which closes dimensionally only for an irradiance, and
-// sunDiscPhysical divides it by Omega to recover a radiance.  So the code
+// anywhere, which closes dimensionally only for an irradiance.  So the code
 // was right and the label was wrong.  The audit, with all three proofs, is
 // in src/renderer/Atmosphere.h section 1.
 //
@@ -5872,35 +5800,6 @@ float3 skyColorBase(float3 ro, float3 rd, inout uint seed) {
     }
     float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
     return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
-}
-
-// --- Planetary P5 (#259): the sky a lobe that already NEE'd the sun sees ---
-//
-// Full sky budget, minus exactly the sun DISC that skyColor injects for the
-// current mode. Not skyColorBase: that also drops the moon, the stars and
-// (in physical mode) three quarters of the march budget, and a water
-// reflection is the one place the sky is the subject rather than an ambient
-// tap.
-//
-// WHY IT IS EXACT IN PHYSICAL MODE. sunDiscPhysical returns
-// T * E / omega and sunIrradianceAt returns E * T, so the disc's radiance
-// times its solid angle IS the irradiance the NEE integrates -- the two
-// estimators partition the same light with no seam and no scale factor to
-// agree on. In procedural and Hosek modes sunDisc bundles a 2-8 degree
-// atmospheric HALO with the disc, so subtracting it also removes the
-// reflected halo: a small under-count in those modes, in the conservative
-// direction, and the alternative is a disc-only variant of a function three
-// other call sites share.
-float3 skyColorNoSunDisc(float3 ro, float3 rd, inout uint seed) {
-    uint mode = uint(sun_and_mode.w);
-    float3 s = skyColor(ro, rd, seed);
-    if (mode == 3u) {
-        s -= sunDisc(rd, sun_and_mode.xyz);
-    } else if (mode == 2u) {
-        s -= sunDisc(rd, sun_and_mode.xyz)
-           + procSkyInlineSunDiscAndHalo(rd, sun_and_mode.xyz);
-    }
-    return max(s, float3(0.0));
 }
 
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up

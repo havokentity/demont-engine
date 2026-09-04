@@ -1457,34 +1457,30 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // declared in its own PR; not touched here.
         add_binding(37, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // --- end Wave 9 god rays -----------------------------------
-        // --- Planetary P4 (#258) -----------------------------------
-        // Bindings 36 / 38 / 39: terrain_verts, terrain_indices and the
-        // per-instance descriptor SSBO. Declared UNCONDITIONALLY, i.e.
-        // even in a PT_PLANET_ENABLED=OFF build where PathTrace.slang
-        // does not declare them.
-        //
-        // That asymmetry is deliberate and only safe in this direction:
-        // a layout that is a strict superset of what a shader declares
-        // is legal (the extra descriptors go unused), whereas a shader
-        // declaring a binding the layout lacks is a hard
-        // vkCreateComputePipelines failure even under PARTIALLY_BOUND.
-        // Keeping the layout identical across both gate states also
-        // means the descriptor-pool sizing below does not fork.
+        // --- VESTIGIAL: removed planetary bindings -----------------
+        // Bindings 36 / 38 / 39 (terrain_verts, terrain_indices, the
+        // per-instance descriptor SSBO) and 47 (land_albedo raster) fed
+        // the removed planetary terrain / land-cover. PathTrace.slang no
+        // longer declares them and the engine no longer binds them, so
+        // they are now unused. They are LEFT DECLARED here on purpose: a
+        // descriptor-set layout that is a strict superset of what a shader
+        // declares is legal (the extra descriptors just go unused),
+        // whereas a shader declaring a binding the layout LACKS is a hard
+        // vkCreateComputePipelines failure. Removing them is safe but
+        // untested on this arc (Mac builds Metal only) and binding 36 may
+        // be shared with the fog kernel, so pruning them is left to the
+        // owner's next Vulkan build. Harmless to keep; the descriptor-pool
+        // sizing below already accounts for them.
         add_binding(36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         add_binding(38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         add_binding(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // #280: binding 46, the 32x32 multiple-scattering table
-        // (atmo_ms_lut). A storage buffer built on the host, so it costs a
-        // descriptor and no pipeline. 40..45 belong to OceanCascades (#293),
-        // which has no Vulkan pipeline yet and will need all six added here
-        // when it gets one.
+        // (atmo_ms_lut) -- KEPT. A storage buffer built on the host, so it
+        // costs a descriptor and no pipeline. The shader still declares it;
+        // only its engine slot moved (21 -> 18, see kSlotToBufBinding).
         add_binding(46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        // Land cover (#300): binding 47, the surface albedo raster. Same
-        // shape as 46 -- a storage buffer the host fills, so it costs one
-        // descriptor and no pipeline -- and declared unconditionally for
-        // the same superset reason as 36/38/39 above.
         add_binding(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        // --- end Planetary P4 --------------------------------------
+        // --- end vestigial planetary bindings ----------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
