@@ -7,13 +7,11 @@
 #include "../core/WorldFrame.h"
 #include "../renderer/AnalyticBvh.h"
 #include "../renderer/EditorOverlay.h"
-#include "../renderer/Planet/SurfaceAlbedo.h"   // #300: land-cover raster
 #include "../renderer/TriangleBvh.h"
 #include "../rhi/Device.h"
 #include "../rhi/Types.h"
 #include "CaptureFormat.h"
 #include "LensFlare.h"
-#include "PlanetTerrain.h"
 
 #include <glm/glm.hpp>
 
@@ -758,32 +756,7 @@ private:
     // all of them -- the build is ~25 ms on twelve threads and must never
     // sit on the per-frame path.
     void EnsureAtmosphereMultiScatterLut();
-    // Land cover (#300). Loads r_planet_albedo_map and uploads it to the
-    // storage buffer at engine slot 22. Keyed on the path, so it is a no-op
-    // after the first call.
-    void EnsureLandAlbedoRaster();
 
-    // --- Planetary P4 (#258) ---------------------------------------------
-    // Per-frame terrain streaming: reads the cvars, (re)starts the streamer
-    // when a structural one changed, runs one selector/bake/build round and
-    // republishes the TLAS. Called from RenderFrame BEFORE the dispatch
-    // fills tlas_present. Deliberately does NOT touch bake_phase_ -- the
-    // loading-frame gate that blanks the screen for a CSG bake must never
-    // fire for terrain streaming.
-    void UpdatePlanetTerrain();
-    // Rebuild or repoint the scene TLAS from the current instance set
-    // (mesh at instance_id 0, terrain at 1..N). Takes the drain-free
-    // Device::UpdateTLASInstances path whenever the capacity is unchanged,
-    // and only falls back to destroy+CreateTLAS when it is not.
-    void PublishSceneTlas();
-    // Upload the per-instance descriptor SSBO. Index 0 carries the mesh's
-    // material so PathTrace.slang can stop hard-coding it (#53).
-    void EnsureInstanceDescriptors();
-    // Geodetic altitude above the terrain at a canonical world position,
-    // or the planar y when there is no terrain. Feeds the world frame's
-    // lattice choice, the camera-speed scaler and physics ground contact.
-    double TerrainAltitude(const glm::dvec3& p_world) const;
-    // --- end Planetary P4 -------------------------------------------------
     // Wave 8 PBR (#26): upload per-vertex mesh UVs (2 floats per vertex,
     // parallel to mesh_positions) into mesh_uv_buf_id_. Call AFTER
     // RebuildMeshResources (which destroys the previous UV buffer). A
@@ -1178,44 +1151,6 @@ private:
                   "ocean upload ring is shallower than the frames the CPU "
                   "may have in flight -- a slot would be rewritten under a "
                   "live read");
-    // --- #133 PHASE 2 CLOSED THE OTHER HALF OF THIS ----------------------
-    //
-    // Read the contract above carefully and it is about ONE thing: a HOST
-    // write landing outside the GPU timeline. That is the whole reason D
-    // has to clear kMaxFramesInFlight -- replaceRegion is not ordered
-    // against a dispatch that is already executing, so the ring buys the
-    // ordering by not reusing a slot until every frame that could still be
-    // reading it has retired.
-    //
-    // When shaders/OceanCascades.slang solves the cascades there is no host
-    // write at all. The field is produced by a compute dispatch inside
-    // frame F's OWN command buffer, immediately before the PathTrace
-    // dispatch that reads it, and both atlases are device-allocated (so
-    // MTLHazardTrackingModeTracked): Metal orders frame F's write against
-    // frame F-1's read on the same queue for us, exactly as it does for
-    // accum_hdr and denoise_color, which are single-buffered for the same
-    // reason. The premise of the D >= kMaxFramesInFlight + 1 requirement is
-    // simply absent, so the depth is 1 -- 6 MB/frame of upload and two
-    // thirds of the residency recovered.
-    //
-    // kOceanUploadRing itself is UNCHANGED at 3 and still carries the
-    // assertion above, because the CPU fallback still writes from the host:
-    // the software backend, Vulkan (whose shared descriptor-set layout does
-    // not declare this kernel's bindings), and r_ocean_gpu 0 on Metal all
-    // take it, and for them the race and its fix are exactly as #295 left
-    // them.
-    static constexpr int kOceanUploadRingGpu = 1;
-    // The runtime depth still has to FIT the handle arrays below, which are
-    // sized at compile time by the deeper of the two. This is the load-
-    // bearing relation between the pair -- ocean_tex_slot_ is
-    // (slot + 1) % ring and indexes those arrays directly.
-    static_assert(kOceanUploadRingGpu <= kOceanUploadRing,
-                  "the GPU-solved ring must fit the texture handle arrays, "
-                  "which are sized by kOceanUploadRing");
-    // How many texture slots the ocean field needs under a given solver.
-    static constexpr int OceanUploadRingFor(bool gpu_solved) {
-        return gpu_solved ? kOceanUploadRingGpu : kOceanUploadRing;
-    }
 
     std::unique_ptr<pt::ocean::OceanFFT>        ocean_;
     std::uint64_t ocean_disp_tex_id_[kOceanUploadRing]   = {0, 0, 0};
@@ -1236,223 +1171,6 @@ private:
     // the solver's current fields. Reallocates on grid-size change.
     void EnsureOceanUploaded();
     // --- end Wave 8 ocean --------------------------------------------------
-
-    // --- Planetary P5 (#259): the planetary ocean --------------------------
-    //
-    // CASCADE PERIODS. Three tile sizes whose prime factorisations share
-    // nothing: 1793 = 11 * 163, 211 prime, 23 prime. The summed field
-    // therefore repeats only at their least common multiple, which is their
-    // product:
-    //
-    //     1793 * 211 * 23 = 8 701 429 m = 8 701 km,
-    //
-    // against a horizon of 4 654 m from eye height, 357 km from 10 km and
-    // 2 294 km from 400 km. The pattern cannot repeat inside the visible
-    // world at any altitude where the waves are still resolved, which is
-    // what "no obvious repetition across thousands of km" has to mean. A
-    // single 50 m tile over 361 million square kilometres is a visible grid
-    // in the first frame.
-    //
-    // They also partition the spectrum: cascade c carries wavelengths from
-    // the next finer cascade's period up to its own, and the finest bottoms
-    // out at its own Nyquist. Running the same Phillips spectrum at three
-    // tile sizes without that window would triple-count every wavelength
-    // all three grids resolve.
-    static constexpr int    kOceanCascades          = 3;
-    static constexpr double kOceanCascadePeriodM[3] = {1793.0, 211.0, 23.0};
-
-    // How many periods of its LONGEST wave a cascade's tile must hold.
-    //
-    // A tile of period P represents only wavenumbers that are integer
-    // multiples of 2*pi/P, so a band whose longest wave is P/n sits on a
-    // ring of radius n in the lattice -- about 2*pi*n independent Fourier
-    // modes. At n = 8 that ring carries ~50 modes and the field reads as
-    // stochastic; at n = 2 it carries 12 and the tile reads as a pattern.
-    // This is the one SHAPING choice in the cascade layout and it is
-    // labelled as one; everything else here is spectrum or geometry.
-    //
-    // It also keeps the partition contiguous for free, because the periods
-    // are ~8.5x apart: cascade c's band top P_c/8 lands on cascade
-    // (c-1)'s band bottom.
-    //
-    // MIRRORED in PathTrace.slang as kOceanBandDivisor; the two are a wire
-    // format, and tests/pt_ocean_fft_test.cpp counts the occurrences.
-    static constexpr double kOceanBandDivisor = 8.0;
-    // Cascade c's band, in wavelength metres. Cascade 0 is unbounded above
-    // -- its own tile period is the longest wave the grid can carry anyway,
-    // and capping it would throw away the spectral peak at high wind
-    // (Pierson-Moskowitz puts it at 2*pi*U^2 / (0.877^2 * g): 120 m at
-    // 12 m/s, but 520 m at 25 m/s).
-    static double OceanBandHiM(int c) {
-        return (c == 0) ? kOceanCascadePeriodM[0]
-                        : kOceanCascadePeriodM[c] / kOceanBandDivisor;
-    }
-    static double OceanBandLoM(int c, std::uint32_t grid) {
-        return (c + 1 < kOceanCascades)
-                   ? kOceanCascadePeriodM[c + 1] / kOceanBandDivisor
-                   // The finest cascade bottoms out at its own Nyquist.
-                   : 2.0 * kOceanCascadePeriodM[c] /
-                         static_cast<double>(grid ? grid : 1u);
-    }
-
-    // The cascade solvers. ocean_ above stays the legacy single-tile solver
-    // and keeps driving the flat MAT_WATER planes, bit for bit; these run
-    // only when r_planet_ocean is on.
-    std::vector<std::unique_ptr<pt::ocean::OceanFFT>> ocean_cascades_;
-    // Live cascade count in the atlas (0 = the legacy single-tile layout).
-    std::uint32_t ocean_tex_cascades_ = 0;
-    // Each cascade's total mean-square slope, from its own spectrum. See
-    // OceanFFT::SlopeVarianceAbove -- derived from H0, not sampled off the
-    // packed grid, so it is a property of the spectrum rather than of the
-    // frame and does not jitter.
-    double ocean_cascade_sigma2_[3] = {0.0, 0.0, 0.0};
-    // Cox & Munk 1954 total mean-square slope at the configured wind. The
-    // constant the BRDF converges to as the ray cone outgrows every cascade.
-    double ocean_cox_munk_sigma2_ = 0.0;
-    // Wind speed the cascade budget line was last logged for. The budget is
-    // the one number that says whether the sea the FFT actually synthesised
-    // is steeper or gentler than the measured ocean, so it is reported
-    // rather than left to be inferred -- once per spectrum, not per frame.
-    float ocean_logged_wind_ = -1.0f;
-    // Scratch for the stacked atlas upload; kept resident so a 3 x 256^2
-    // RGBA32F repack does not allocate 6 MB every frame.
-    std::vector<float> ocean_atlas_disp_;
-    std::vector<float> ocean_atlas_nrm_;
-    // The camera-anchored, lattice-quantised tangent frame the cascades are
-    // laid out in. A pure function of the camera position -- no hysteresis,
-    // which the golden matrix requires. See ComputeOceanTangentFrame.
-    struct OceanTangentFrame {
-        bool       valid = false;
-        glm::dvec3 origin_w{0.0};   // canonical world, on the sea shell
-        glm::dvec3 east_w{1.0, 0.0, 0.0};
-        glm::dvec3 north_w{0.0, 0.0, 1.0};
-        // Tile-space phase per cascade. Cascade 0's is exactly 0 because
-        // the lattice spacing IS cascade 0's period.
-        double     phase[3][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
-    };
-    OceanTangentFrame ComputeOceanTangentFrame(const glm::dvec3& cam_w,
-                                               double sea_radius_m) const;
-    // Step the cascade solvers and repack + upload the stacked atlas.
-    void StepOceanCascades(double t_seconds, std::uint32_t grid);
-
-    // --- #259 / #133 Phase 2: the cascades as a compute pre-pass ----------
-    //
-    // WHAT THIS REMOVED. The CPU cascade solver ran fifteen inverse 2-D
-    // FFTs, three packs, three foam folds, a 6 MB repack and a 6 MB upload
-    // every frame on one thread. Measured on an M4 Max, 120 frames of
-    // tests/goldens/scenes/planet_ocean_boat.cfg at r_ocean_grid_size 256:
-    // 6.39 s with the cascades against 4.52 s at r_ocean 0, i.e. 15.6 ms
-    // per frame -- a 64 fps ceiling before the path tracer does anything.
-    //
-    // WHAT STAYED ON THE HOST, AND WHY. The static base spectrum H0(k).
-    // Its Gaussian amplitudes come from a seeded std::mt19937 and a GPU
-    // cannot promise the same draws, so pt::ocean::OceanFFT remains the
-    // one place the spectrum is built -- which is also what keeps
-    // tests/pt_ocean_fft_test.cpp meaningful and what lets
-    // tests/pt_ocean_gpu_test.cpp compare the two solvers on an identical
-    // input. H0 is uploaded ONCE PER REBUILD (wind / grid / tile /
-    // amplitude / seed / band change), not per frame.
-    //
-    // WHERE THE MARCH BRACKET WENT. oceanRayMarchShell brackets the wave
-    // band at R_sea +/- h_max, and h_max is the summed peak crest, which
-    // now only exists after the pre-pass has run. Rather than stall on a
-    // readback or push last frame's number, the reduce pass writes it into
-    // a metadata row of the displacement atlas one row past the last
-    // cascade -- a row oceanBilinearTexelsC cannot address, because its
-    // wrap is modulo `grid` inside the cascade's own band. The CPU
-    // fallback writes the identical float into the identical texel, so
-    // both paths feed the shader one number from one place and no golden
-    // moved.
-    //
-    // THE FALLBACK IS NOT A CONSOLATION PRIZE. Software has no compute
-    // pipelines at all and its CPU tracer ignores the ocean textures;
-    // Vulkan's shared descriptor-set layout does not declare this kernel's
-    // bindings yet and no Vulkan device has executed any of this arc
-    // (#290). Both take the CPU solver, unchanged, and so does r_ocean_gpu
-    // 0 on Metal -- which is what makes the A/B in the equivalence test a
-    // runtime switch rather than a rebuild.
-    // The pass indices, the field count, the push layout and the dispatch
-    // shapes all live in src/physics/OceanCascadeDispatch.h -- shared
-    // verbatim between this driver and tests/pt_ocean_gpu_test.cpp so
-    // there is exactly one transcription of the shader's wire format.
-    std::uint64_t ocean_gpu_pipeline_id_ = 0;
-    std::uint64_t ocean_gpu_h0_buf_id_      = 0;
-    std::uint64_t ocean_gpu_scratch_buf_id_ = 0;
-    std::uint64_t ocean_gpu_foam_buf_id_    = 0;
-    std::uint64_t ocean_gpu_reduce_buf_id_  = 0;
-    // Shape the GPU buffers were allocated for. A change reallocates and
-    // re-zeroes the foam accumulator, mirroring the CPU solver's
-    // `foam_accum_.assign(cells, 0)` on a grid-size change.
-    std::uint32_t ocean_gpu_buf_grid_     = 0;
-    std::uint32_t ocean_gpu_buf_cascades_ = 0;
-    // Spectrum revision last uploaded, per cascade. 0 = nothing uploaded.
-    std::uint64_t ocean_gpu_spectrum_rev_[3] = {0, 0, 0};
-    // Staging for the H0 upload. Resident so a rebuild does not allocate
-    // 12 MB; touched only on a spectrum change.
-    std::vector<float> ocean_gpu_h0_staging_;
-    // Set by StepOceanCascades when the GPU solver owns this frame's
-    // field; consumed (and cleared) by DispatchOceanCascades.
-    bool   ocean_gpu_pending_   = false;
-    // The per-frame scalars the pre-pass needs. Computed host-side -- the
-    // persistence decay is a std::pow and the whitecap ramp a smoothstep,
-    // and evaluating them here rather than in the kernel removes two
-    // transcendental implementations from the CPU-vs-GPU difference.
-    double ocean_gpu_t_         = 0.0;
-    float  ocean_gpu_decay_     = 0.0f;
-    float  ocean_gpu_wind_cov_  = 0.0f;
-    float  ocean_gpu_lambda_    = 0.0f;
-    float  ocean_gpu_foam_thr_  = 0.5f;
-    float  ocean_gpu_foam_amt_  = 1.0f;
-    float  ocean_gpu_gravity_   = 9.81f;
-    // Absolute sim time of the previous GPU step, for the persistence
-    // decay's dt. Negative = no previous frame (OceanFFT::last_t_'s rule).
-    double ocean_gpu_last_t_    = -1.0;
-    // True while the GPU solver owns the field, so EnsureOceanUploaded
-    // skips the repack + WriteTexture and the ring collapses to one slot.
-    bool   ocean_gpu_owns_field_ = false;
-
-    // Is the compute pre-pass usable this frame? Metal + a built pipeline
-    // + r_ocean_gpu != 0. Software returns a non-zero pipeline id for ANY
-    // kernel name (SoftwareDevice::CreateComputePipeline is a bookkeeping
-    // stub), so the backend test is load-bearing and not belt-and-braces.
-    bool OceanGpuAvailable() const;
-    // (Re)allocate the pre-pass buffers for this shape. Returns false if
-    // anything failed, which drops the frame back to the CPU solver.
-    bool EnsureOceanGpuResources(std::uint32_t grid, std::uint32_t cascades);
-    // Upload any cascade whose spectrum was rebuilt since the last call.
-    void UploadOceanGpuSpectrum(std::uint32_t grid, std::uint32_t cascades);
-    // Record the five passes. No-op unless StepOceanCascades armed it.
-    void DispatchOceanCascades(pt::rhi::CommandBuffer* cb);
-
-    // --- The amplitude solve, cached on the spectrum's own key -----------
-    //
-    // The Cox-Munk amplitude is a pure function of {grid, wind, wind
-    // direction, gravity, seed} -- everything else about a cascade's
-    // spectrum is derived from those through the band partition. Solving
-    // it re-ran RebuildBaseSpectrum TWICE per cascade per frame (once at
-    // A = 1 to measure the raw slope variance, once at the solved A), i.e.
-    // six seeded mt19937 sweeps over grid^2 cells every frame for an
-    // answer that cannot change until one of those five numbers does.
-    //
-    // Caching it is bit-exact rather than approximately equal: H0 is a
-    // deterministic function of the config, so the spectrum the cache
-    // leaves in place IS the spectrum the rebuild would have produced.
-    struct OceanAmpKey {
-        std::uint32_t grid     = 0;
-        float         wind     = 0.0f;
-        float         wind_dir = 0.0f;
-        float         gravity  = 0.0f;
-        std::uint32_t seed     = 0;
-        bool operator==(const OceanAmpKey&) const = default;
-    };
-    OceanAmpKey ocean_amp_key_{};
-    bool        ocean_amp_valid_ = false;
-    float       ocean_amp_       = 0.0f;
-    // Each cascade's mean-square slope at the solved amplitude. Same
-    // argument as the amplitude: a pure function of the spectrum, so it is
-    // recomputed only when the spectrum is.
-    double      ocean_amp_sigma2_[3] = {0.0, 0.0, 0.0};
-    // --- end Planetary P5 --------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object
@@ -1650,18 +1368,6 @@ private:
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;
     std::uint64_t                               box_ibuf_id_           = 0;
-    // --- Planetary P4 (#258): streamed terrain ---------------------------
-    // Owns the chunk arena, the shared index arena, the per-chunk BLASes
-    // and the TLAS instance array. Non-null only while r_planet_terrain is
-    // on AND the backend has hardware ray tracing. See PlanetTerrain.h for
-    // the four-stage pipeline and for what still stalls.
-    std::unique_ptr<pt::engine::PlanetTerrain>  planet_terrain_;
-    // Per-instance descriptor SSBO (engine buffer slot 20 -> vk::binding
-    // 39). Index 0 is the CSG / glTF mesh and carries exactly the
-    // constants PathTrace.slang used to hard-code, which is what keeps a
-    // planet-free scene bit-identical; 1..N are terrain chunks.
-    std::uint64_t                               instance_desc_id_      = 0;
-    std::uint32_t                               instance_desc_capacity_ = 0;
     // --- #280: Hillaire 2020 multiple-scattering table ---------------------
     // 32 x 32 float4, engine buffer slot 21 -> vk::binding 40. Built on the
     // CPU (src/renderer/Atmosphere.cpp) rather than by a compute pass, per
@@ -1681,30 +1387,9 @@ private:
         bool operator==(const AtmoMsKey&) const = default;
     };
     AtmoMsKey                                   atmo_ms_key_{};
-    // --- Land cover (#300): the surface albedo raster --------------------
-    // Immutable data, so unlike the multiple-scattering LUT there is
-    // nothing to rebuild -- the key is just the path, and `loaded_` is what
-    // distinguishes "never tried" from "tried and the file was missing", so
-    // a failed load logs once instead of once a frame.
-    pt::planet::SurfaceAlbedoMap                land_albedo_map_{};
-    std::uint64_t                               land_albedo_buf_id_    = 0;
-    std::string                                 land_albedo_key_;
-    bool                                        land_albedo_loaded_    = false;
     // Capacity the scene TLAS was created with. Device::UpdateTLASInstances
     // never grows a structure, so a change here means destroy + recreate.
     std::uint32_t                               scene_tlas_capacity_   = 0;
-    // Stall counter snapshot from the frame the terrain last published, so
-    // `planet_stats` can report the DELTA rather than a lifetime total --
-    // the claim being tested is "a paced update moves it by zero".
-    std::uint64_t                               planet_stall_baseline_ = 0;
-    // Cumulative evidence for the phase's central streaming claim. Every
-    // drain-free republish should add ZERO to Device::AccelGpuStallCount;
-    // the totals are logged at shutdown so the claim is measured rather
-    // than asserted. P0 (#254) added the counter for exactly this.
-    std::uint64_t                               planet_tlas_publishes_ = 0;
-    std::uint64_t                               planet_tlas_stalls_    = 0;
-    std::uint64_t                               planet_tlas_rebuilds_  = 0;
-    // --- end Planetary P4 ------------------------------------------------
     // --- Wave 8 PBR (#26) -- per-vertex mesh UVs ------------------------
     // Parallel to box_vbuf_id_ (mesh_positions): 2 floats (u, v) per
     // vertex, uploaded from the glTF TEXCOORD_0 attribute in
@@ -2304,44 +1989,6 @@ private:
     // "pipelines ready" message on exit -- avoids a per-frame log
     // spam during the 1-3s build window.
     bool                                        loading_frame_active_  = false;
-    // --- Planetary P4 (#258): the capture settle barrier -----------------
-    // True for the single frame in which PlanetTerrain::Settle ran the
-    // selector to its fixed point. Treated exactly like a loading frame:
-    // the world does not advance (freeze_sims_for_capture) and the frame
-    // does not count against the smoke budget, so a golden capture starts
-    // from a settled planet rather than from whatever had streamed in by
-    // then. Bounded by pt_planet_settle_rounds so a misconfigured scene
-    // cannot hang the smoke test forever.
-    bool                                        planet_settling_       = false;
-    // Set by the `earth` scene seed and by the `planet_stand` command:
-    // snap the camera onto the terrain surface once the streamer exists.
-    // Carries the requested eye height in metres; negative means "no
-    // request pending".
-    double                                      planet_stand_eye_m_    = -1.0;
-    bool                                        planet_stand_done_     = false;
-    // The settle barrier runs once per streamer lifetime. Cleared when
-    // r_planet_terrain re-inits the streamer, so toggling terrain off and
-    // on inside one smoke run re-settles rather than capturing whatever
-    // the fresh streamer had managed on its first frame.
-    bool                                        planet_settled_        = false;
-    // Set on the barrier frame, consumed on the first frame that actually
-    // counts, where it forces one more accumulator reset.
-    //
-    // Whether the barrier frame DISPATCHES is a race the capture must not
-    // inherit. UpdatePlanetTerrain runs before RenderFrame's loading-frame
-    // gate, so if the async pipeline build is still in flight the barrier
-    // frame returns before the path-trace dispatch and contributes nothing;
-    // if the build has already landed, the same frame dispatches one sample
-    // at the held frame_index_ and that sample is in the accumulator when
-    // the capture starts. The pipeline build and the terrain settle both
-    // take a second or two, so which one wins is wall clock: measured once
-    // in 36 renders of planet_surface, as a mean delta of 1.21 spread
-    // evenly over every lit pixel and zero in the sky -- the signature of a
-    // sample-count difference rather than a geometry one. Discarding the
-    // accumulator on the first counted frame makes the capture exactly the
-    // frames that were counted, either way.
-    bool                                        planet_settle_flush_   = false;
-    // --- end Planetary P4 -------------------------------------------------
     // True while Run() is executing with a smoke-frame budget
     // (pt_smoke_frames > 0). Tick reads it to freeze dt-integrating
     // subsystems during un-counted loading frames so golden captures

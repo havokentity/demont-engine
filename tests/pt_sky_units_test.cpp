@@ -280,22 +280,17 @@ TEST_CASE("the source pins survive a CRLF checkout") {
 
 TEST_CASE("the sun disc and the sun NEE partition one light source") {
     // This is the audit's operational statement.  sunIrradianceAt returns an
-    // irradiance E; sunDiscPhysical returns E / Omega, a radiance.  The two
-    // estimators therefore describe the same source and their product with
-    // the solid angle must close: L_disc * Omega == E.  If the 80 had been a
-    // radiance, the disc would be E/Omega^2 and this identity would fail by
-    // Omega ~ 6.9e-5.
+    // irradiance E; the numeric identity L_sun = E / Omega below closes only
+    // for an irradiance.  If the 80 had been a radiance, L_sun would be
+    // E/Omega^2 and the identity would fail by Omega ~ 6.9e-5.  (The physical
+    // sun DISC that also carried E/Omega was removed with the planetary epic;
+    // the NEE site and the numeric identity are the surviving halves.)
     //
-    // Asserted on the SOURCE because there is no host entry point to call,
-    // and asserted as the presence of the division rather than as a
-    // numeric, because the numeric identity is exact by construction and
-    // what can rot is the expression.
+    // Asserted on the SOURCE because there is no host entry point to call.
     const std::string pt = ReadFile(PT_SHADER_PATHTRACE_PATH);
-    CHECK(CountOccurrences(pt, "T * (kPtSolarIrradiance / max(omega, 1.0e-12)) * bright")
-          == 1);
 
-    // And the NEE site multiplies by a BRDF and a cosine with no solid
-    // angle -- the other half of the same argument.
+    // The NEE site multiplies by a BRDF and a cosine with no solid angle --
+    // the other half of the same argument.
     CHECK(CountOccurrences(pt, "throughput * sun_rad * trans * brdf * n_dot_l") == 1);
 
     // Numerically, for the sun's true half-angle: E / Omega at the rebased
@@ -521,10 +516,10 @@ TEST_CASE("the shader and the host agree about the table's parameterisation") {
     // The unbuilt-table guard, which is what stops a zero-filled
     // placeholder from reading as "multiple scattering is negligible".
     CHECK(CountOccurrences(pt, "atmo_ms_lut[0].w > 0.5") == 1);
-    // Two consumers: the sky march and the aerial-perspective march. One
-    // would mean the horizon and the sky above it disagree about how much
-    // multiply scattered light there is, which is a seam.
-    CHECK(CountOccurrences(pt, "ptAtmoMultiScatter(") == 3);   // 1 definition + 2 call sites
+    // One consumer remains: the procedural/hosek sky's multi-scatter fetch.
+    // The second (skyPhysical's aerial-perspective march) went with the
+    // physical marched sky when the planetary features moved to VkDemonT.
+    CHECK(CountOccurrences(pt, "ptAtmoMultiScatter(") == 2);   // 1 definition + 1 call site
 }
 
 // ===========================================================================

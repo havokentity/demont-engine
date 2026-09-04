@@ -387,15 +387,13 @@ public:
     // cost of a full Update().
     void EnsureSpectrum();
 
-    // --- The GPU cascade solver's view of this one (#259 / #133 P2) ------
+    // --- Base-spectrum accessors ----------------------------------------
     //
-    // The compute pre-pass in shaders/OceanCascades.slang does the
-    // per-frame work -- the time evolution, the five spectra, the fifteen
-    // inverse FFTs, the pack and the foam -- but NOT the static base
-    // spectrum. H0's Gaussian amplitudes come from a seeded std::mt19937
-    // and "the same Gaussians" is not something a GPU can promise, so the
-    // host stays the single source of the spectrum and uploads it once per
-    // rebuild. These three accessors are that hand-off.
+    // These exposed H0(k) for the (now removed) planetary GPU cascade
+    // pre-pass to upload once per rebuild -- the seeded std::mt19937
+    // Gaussian amplitudes are not something a GPU can reproduce, so the host
+    // stayed the single source of the spectrum. They are harmless read-only
+    // accessors and are kept for tests/pt_ocean_fft_test.cpp.
     //
     // `SpectrumRevision` increments on every RebuildBaseSpectrum, so a
     // caller can tell "the spectrum I uploaded is still the spectrum this

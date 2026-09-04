@@ -73,11 +73,6 @@ if(PT_LIGHT_TREE)
 else()
     set(_pt_light_tree_def "-DPT_LIGHT_TREE_ENABLED=0")
 endif()
-if(PT_PLANET_ENABLED)
-    set(_pt_planet_def "-DPT_PLANET_ENABLED=1")
-else()
-    set(_pt_planet_def "-DPT_PLANET_ENABLED=0")
-endif()
 # --- end Megakernel feature gates -----------------------------------------
 pt_compile_slang(
     TARGET  pt_rhi_metal
@@ -86,7 +81,7 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir
-    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
+    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def}
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal
@@ -187,21 +182,6 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/CloudsComposite.slang
-    STAGE   compute
-    ENTRY   main
-    TARGETS metal
-)
-# Planetary P5 (#259) / water roadmap #133 Phase 2 -- the ocean cascade FFT
-# solver as a compute pre-pass. One entry point dispatched five times (rows,
-# columns, pack, reduce, foam) with the pass index in the push block, the
-# same shape GodRays.slang uses. Imports nothing: the kernel is a closed
-# radix-2 inverse FFT over a spectrum the host uploads once per rebuild.
-# Built unconditionally; Engine::DispatchOceanCascades elides every dispatch
-# unless the planetary cascades are on and r_ocean_gpu != 0, so the legacy
-# single-tile MAT_WATER ocean and every non-planetary scene pay nothing.
-pt_compile_slang(
-    TARGET  pt_rhi_metal
-    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/OceanCascades.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

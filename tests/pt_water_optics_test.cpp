@@ -1730,15 +1730,16 @@ TEST_CASE("shader and engine mirrors are still faithful") {
     CHECK(countOf(pt, "in_water=1;") == 0u);
     CHECK(countOf(pt, "in_water=0;") == 0u);
     CHECK(countOf(pt, "sr_in_water=1-sr_in_water;") == 0u);
-    // ...and every NEE site now forwards the stack. Six call sites carried
-    // the bit; all six must carry the stack.
-    // Six NEE sites carried the bit, and the ambient gate below adds a
-    // seventh. The "medium);" form counts six of those seven; the odd one
-    // out is the Lambert sun NEE, whose call is the middle of a ternary and
-    // so has no semicolon after it. Both are pinned, because asserting only
-    // the total would be satisfied by seven copies of the wrong one.
-    CHECK(countOf(pt, "cone_hit,medium)") == 7u);
-    CHECK(countOf(pt, "cone_hit,medium);") == 6u);
+    // ...and every NEE site now forwards the stack.
+    // Five NEE sites carry the bit, and the ambient gate below adds a sixth.
+    // (The planetary-ocean sun-NEE that once made it six-plus-ambient went
+    // with the planetary features to VkDemonT.) The "medium);" form counts
+    // five of those six; the odd one out is the Lambert sun NEE, whose call
+    // is the middle of a ternary and so has no semicolon after it. Both are
+    // pinned, because asserting only the total would be satisfied by six
+    // copies of the wrong one.
+    CHECK(countOf(pt, "cone_hit,medium)") == 6u);
+    CHECK(countOf(pt, "cone_hit,medium);") == 5u);
 
     // --- the phase functions ------------------------------------------
     CHECK(countOf(pm, "floatk=(1.0-d)/(1.0+d);") == 1u);
