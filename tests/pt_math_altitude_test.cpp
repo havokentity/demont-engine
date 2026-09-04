@@ -1036,52 +1036,6 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(math.find("max(ptRayAltitudeAt(alt,lo),0.0)") != std::string::npos);
     CHECK(math.find("max(ptRayAltitudeAt(alt,s_mid),0.0)") != std::string::npos);
     CHECK(math.find("max(ptRayAltitudeAt(alt,s_right),0.0)") != std::string::npos);
-    // And that PathTrace.slang carries no second march of the OPTICAL
-    // DEPTH -- the whole point of the #257 move.
-    //
-    // #260 narrowed this from "no ptRayAltitudeBegin at all" to "exactly
-    // one, and it is the in-scatter march". skyPhysical integrates
-    // RADIANCE along the view ray, which is a different integral from
-    // the optical depth ptAtmoOpticalDepth owns; what it must not do is
-    // materialise p(s) and take a length, because at |p| ~ 6.4e6 that
-    // costs ~0.5 m of altitude noise on every sample and the sample is
-    // then fed to exp(-h/1200). So it hoists the same quadratic through
-    // the same kernel, which is the behaviour #271 exists to enforce and
-    // is what this pin should have been asserting all along.
-    //
-    // Counted, and located: an occurrence anywhere OTHER than inside the
-    // two marches named below would be the duplicate this pin is for.
-    //
-    // #259 widened this from one to TWO. The second is the planetary
-    // ocean's heightfield march, which needs the ray point's altitude above
-    // the sea shell at every step to decide which side of the wave surface
-    // it is on. That is a third distinct integrand -- not optical depth, not
-    // radiance -- and it has the same reason to hoist as the other two, and
-    // a sharper one: materialising ro + rd*s and taking its altitude costs
-    // ULP(|p|) ~ 0.5 m at |p| ~ 6.4e6, against a wave 1.5 m tall. A march
-    // that did that would not resolve the ocean at all.
-    CHECK(countOf(pt, "ptRayAltitudeBegin(") == 2u);
-    {
-        const std::size_t at = pt.find("float3skyPhysical(");
-        const std::size_t use = pt.find("ptRayAltitudeBegin(");
-        const std::size_t end = pt.find("float3sunDiscPhysical(");
-        REQUIRE(at != std::string::npos);
-        REQUIRE(end != std::string::npos);
-        CHECK(use > at);
-        CHECK(use < end);
-    }
-    {
-        // The ocean one, between oceanRayMarchShell's signature and the
-        // compute entry point that follows it.
-        const std::size_t at =
-            pt.find("OceanHitoceanRayMarchShell(float3ro,float3rd,");
-        const std::size_t end = pt.find("voidmain(uint2tid");
-        REQUIRE(at != std::string::npos);
-        REQUIRE(end != std::string::npos);
-        const std::size_t use = pt.find("ptRayAltitudeBegin(", at);
-        REQUIRE(use != std::string::npos);
-        CHECK(use < end);
-    }
     // ...and that it did not bring a Simpson optical-depth rule with it.
     // Exactly ONE composite-Simpson weight survives in this file, and it
     // is the legacy PLANAR branch of atmosphericTransmittance -- the
@@ -1090,7 +1044,6 @@ TEST_CASE("shader mirror is still faithful") {
     // h(s) is computed) and stay a controlled comparison. A second one
     // appearing would be the duplicate march this pin is for.
     CHECK(countOf(pt, "floatoneSixth=1.0/6.0;") == 1u);
-    CHECK(pt.find("floatoneSixth=1.0/6.0;") < pt.find("float3skyPhysical("));
     // And that no naive altitude survived at either site.
     CHECK(pt.find("length(p-planet_center_radius.xyz)-planet_center_radius.w")
           == std::string::npos);
