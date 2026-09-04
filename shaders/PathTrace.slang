@@ -6786,13 +6786,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
         bool   skip_sky_on_miss   = false;
         bool   prev_was_lambert_nee = false;   // previous bounce was Lambert with env-map NEE
         float  prev_lambert_brdf_pdf = 0.0;    // cosine-hemisphere PDF of the bounce dir sampled there
-        // Planetary P5 (#259): the previous bounce was a planetary-ocean
-        // specular hit that integrated the sun by NEE, so the sun DISC must
-        // come out of this segment's sky or it is counted twice. Exactly one
-        // segment of scope -- snapshotted and cleared at the top of the loop
-        // body -- because the suppression belongs to the ray the water
-        // launched and to nothing after it.
-        bool   ocean_sun_nee = false;
         // --- Underwater medium tracking (Phase 4, #134; P7 #261) -------------
         // Per-ray "which medium is this segment travelling through?" stack.
         // Initialised from water_state.x (host scans analytic primitives at
@@ -6945,11 +6938,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // at THIS ray's origin (0 at the eye, grown by the accumulate a
         // few lines below each time the path bounces).
         PtRayCone cone = ptConeMake(cone_width, cone_spread);
-        // Planetary P5 (#259): consume the previous segment's sun-disc
-        // suppression and clear it in the same breath, so it can never
-        // outlive the ray it belongs to.
-        bool ocean_sun_nee_prev = ocean_sun_nee;
-        ocean_sun_nee = false;
         HitInfo h = traceScene(ro, rd, shutter_t01, cone);
         // --- Wave 8 ocean (#25) -- displace the analytic water plane --------
         // When the FFT ocean is on (ocean_params0.x != 0) and the ray hit a
@@ -6961,11 +6949,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // perspective, Beer's-law segment, and shading uniformly. h.albedo's
         // alpha carries the per-hit foam coverage for the BRDF branch.
         float ocean_foam_here = 0.0;
-        // The microfacet alpha^2 the sub-footprint wave slope would add at a
-        // planetary-ocean hit. Held at 0 for the game water, and the water
-        // BRDF's rough branch is gated on it being positive, so every
-        // MAT_WATER surface keeps its mirror path.
-        float ocean_alpha2_here = 0.0;
 #if PT_WATER_ENABLED
         if (ocean_params0.x != 0.0 && h.hit && h.mat == MAT_WATER &&
             abs(dot(h.normal, localUp(ro + rd * h.t))) > 0.5) {
@@ -7214,13 +7197,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         radiance += throughput * sky_full;
                     }
                 } else {
-                    // Planetary P5 (#259): a bounce ray launched by a
-                    // planetary-ocean specular hit sees the sky WITHOUT its
-                    // sun disc -- that lobe already integrated the sun with
-                    // a shadow ray. Every other bounce is unchanged.
                     radiance += clampIndirect(throughput *
-                        (ocean_sun_nee_prev ? skyColorNoSunDisc(ro, rd, seed)
-                                            : skyColor(ro, rd, seed)));
+                                              skyColor(ro, rd, seed));
                 }
             }
             break;
@@ -7934,13 +7912,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // use it directly instead of re-perturbing with the Phase 1
             // value-noise wave normal (which would double-bump the
             // surface). Off -> the Phase 1 analytic wave normal as before.
-            // Planetary P5 (#259) adds the second disjunct: the Phase 1
-            // wave normal is a value-noise field in world XZ, which on a
-            // sphere is a horizontal-plane pattern wrapped round a globe.
-            // A planetary shell takes its macro normal even when the FFT is
-            // off -- that is the smooth Cox-Munk sphere the handover is
-            // measured against, and it must not have ripples painted on it.
-            float3 shading_n = (ocean_params0.x != 0.0 || planet_ocean.x > 0.0)
+            float3 shading_n = (ocean_params0.x != 0.0)
                                    ? h.normal
                                    : waterShadingNormal(hit_pt, h.normal);
             // --- Wave 9 ocean-foam ------------------------------------------
@@ -7994,132 +7966,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float ndi_s = dot(shading_n, rd);
             float3 nf_s = (ndi_s < 0.0) ? shading_n : -shading_n;
 
-            // --- Planetary P5 (#259): sun glitter, by NEE not by luck -----
-            //
-            // "Sun glitter off a wave field is the single most recognisable
-            // feature of an ocean in a satellite photo" is the reason this
-            // phase exists, and it is exactly the thing a purely stochastic
-            // specular estimator cannot deliver. The sun disc subtends
-            // 0.0093 rad; at the far-field alpha of 0.254 the chance that a
-            // VNDF sample lands on it is (0.00465 / 0.254)^2 = 3.4e-4, so at
-            // 192 samples per pixel a from-orbit frame gets 0.065 hits --
-            // and r_firefly_clamp then bites the few that land. MEASURED:
-            // the ocean from 400 km renders with no glint at all.
-            //
-            // So integrate the sun directly: one shadow ray, the GGX BRDF
-            // evaluated toward a jittered point on the disc, and the disc
-            // taken out of the bounce ray's sky (see skyColorNoSunDisc,
-            // where the two estimators are shown to partition the same
-            // light exactly in physical-sky mode).
-            //
-            // Planetary water only. The flat MAT_WATER planes keep the Wave
-            // 8 estimator untouched, and MAT_METAL keeps its own -- widening
-            // this to every specular surface is a real improvement and a
-            // different change.
-            bool did_ocean_sun_nee = false;
-            // #305: the sun's visibility from this very point, cached. The
-            // water-leaving term below needs exactly the occlusion this
-            // block is about to measure, and a second shadow ray toward a
-            // direction 0.53 deg away would buy nothing at the price of
-            // doubling the ray count on a frame that is mostly ocean.
-            // Negative = not measured (the NEE block did not run), which
-            // is the signal to fire one.
+            // #305: the sun's visibility from this point, cached for the
+            // water-leaving term below. -1 = not measured, which is the
+            // signal for that block to fire its own shadow ray. (The
+            // planetary sun-glitter NEE that used to fill it in was removed
+            // with the planetary epic, so it is always unmeasured here.)
             float3 ocean_sun_trans = float3(-1.0);
-            if (planet_ocean.x > 0.0 && !ptMediumIsWater(medium) &&
-                uint(sun_and_mode.w) >= 2u) {
-                float3 sun_dir  = sun_and_mode.xyz;
-                float  sun_elev = elevationAt(hit_pt, sun_dir);
-                float  ndv      = dot(nf_s, -rd);
-                if (sun_elev > 0.0 && ndv > 0.0) {
-                    // A perfectly smooth interface has a delta lobe and no
-                    // NEE to do; the floor keeps D finite there and is the
-                    // same 0.02 roughness floor anisoAlpha already clamps to
-                    // (0.02^2 = 4e-4).
-                    float a  = max(sqrt(ocean_alpha2_here), 4.0e-4);
-                    float3 l = sampleSunDisc(sun_dir, seed);
-                    float ndl = dot(nf_s, l);
-                    float3 hv = normalize(l - rd);
-                    float ndh = dot(nf_s, hv);
-                    if (ndl > 0.0 && ndh > 0.0) {
-                        // Trowbridge-Reitz D, and the same height-correlated
-                        // Smith G2 the sampled lobe uses, so the NEE and the
-                        // BSDF sample are the same BRDF.
-                        float a2 = a * a;
-                        float dd = ndh * ndh * (a2 - 1.0) + 1.0;
-                        float D  = a2 / (3.14159265358979 * dd * dd);
-                        float3 t1, t2;
-                        anisoTangentFrame(nf_s, 0.0, t1, t2);
-                        float3 vl = float3(dot(-rd, t1), dot(-rd, t2), ndv);
-                        float3 ll = float3(dot(l, t1),  dot(l, t2),  ndl);
-                        float G2 = ggxG2Aniso(ll, vl, a, a);
-                        float F  = fresnelSchlick(max(dot(hv, l), 0.0), 0.02);
-                        float fr_spec = D * G2 * F / (4.0 * ndv * ndl);
-                        float3 trans = transmittance(
-                            ptRayOrigin(hit_pt, nf_s, cone_hit, l), l, 1e30,
-                            shutter_t01, cone_hit, medium);
-                        ocean_sun_trans = trans;   // #305 reuses this
-                        if (any(trans > float3(0.0))) {
-                            float3 sun_rad =
-                                sunIrradianceAt(hit_pt, sun_dir, sun_elev);
-                            float3 contrib =
-                                throughput * sun_rad * trans * fr_spec * ndl;
-                            radiance += (b == 0u) ? contrib
-                                                  : clampIndirect(contrib);
-                        }
-                        did_ocean_sun_nee = true;
-                    }
-                }
-            }
-            // --- Planetary P5 (#259): the other half of the handover ------
-            //
-            // Everything above this line is geometry. This is where the
-            // slope variance the geometry no longer carries comes back as a
-            // BRDF: a GGX visible-normal sample about the macro normal with
-            // alpha^2 = sigma^2_CoxMunk - sigma^2_resolved(cone). At the
-            // boat that alpha is the sub-grid capillary band and the lobe is
-            // a near-mirror; from orbit it is the whole Cox-Munk variance
-            // and the planet has the broad sun glitter every satellite photo
-            // of an ocean shows. No fade, no altitude, no cvar -- only the
-            // ray cone, and a conservation law that makes the two halves sum
-            // to the same measured constant at every point of the climb.
-            //
-            // The MEDIUM decision stays on the macro normal. A microfacet
-            // normal can point to the other side of the interface, and
-            // letting it decide "am I entering or leaving the water" would
-            // corrupt in_water for the rest of the path -- the medium is a
-            // property of the surface, not of the microfacet.
-            //
-            // nf_m == nf_s exactly when alpha^2 is 0, which is every
-            // non-planetary water surface, so the legacy path is untouched.
+            // The planetary sub-footprint microfacet lobe (Cox-Munk slope
+            // variance the geometry no longer carries) was removed with the
+            // planetary epic, so the shading normal IS the macro normal.
             float3 nf_m = nf_s;
-            if (ocean_alpha2_here > 0.0) {
-                float a_ggx = sqrt(ocean_alpha2_here);
-                float3 tt, tb;
-                anisoTangentFrame(nf_s, 0.0, tt, tb);
-                float3 vl = float3(dot(-rd, tt), dot(-rd, tb), dot(-rd, nf_s));
-                if (vl.z > 0.0) {
-                    float3 hl = sampleGgxVndfLocal(vl, a_ggx, a_ggx,
-                                                   randf(seed), randf(seed));
-                    float3 ll = reflect(-vl, hl);
-                    // Reject a microfacet whose reflected direction lands
-                    // below the MACRO horizon. Such a sample is shadowed by
-                    // the surface it came from, and taking it would launch
-                    // a ray into the water while the medium bookkeeping
-                    // still says air. Falling back to the macro normal is
-                    // the conservative answer and it costs nothing at the
-                    // small alphas where it almost never fires.
-                    if (ll.z > 0.0 && hl.z > 0.0) {
-                        nf_m = normalize(hl.x * tt + hl.y * tb + hl.z * nf_s);
-                        // VNDF importance sampling leaves the masking ratio
-                        // G2/G1 as the surviving weight (Heitz 2018) --
-                        // exactly as sampleClearcoat and the anisotropic
-                        // metal lobe already do it here.
-                        throughput *= ggxG2Aniso(ll, vl, a_ggx, a_ggx) *
-                                      (1.0 + ggxLambdaAniso(vl, a_ggx, a_ggx));
-                    }
-                }
-            }
-            // --- end Planetary P5 -----------------------------------------
 
             // --- Planetary P7 (#261): why the outside index is still 1.0 ---
             //
@@ -8181,11 +8037,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // MAT_DIELECTRIC reflect branch). Clear the suppression.
                 skip_sky_on_miss = false;
                 prev_was_lambert_nee = false;
-                // Planetary P5 (#259): ...except for the sun DISC, which
-                // this lobe just integrated by NEE. Set on the REFLECTED
-                // lobe only: a transmitted ray leaves through the interface
-                // and whatever it eventually sees is a different integral.
-                ocean_sun_nee = did_ocean_sun_nee;
             } else {
                 // Refraction: the ray crosses the water interface.
                 // ndi_s < 0 means the shading normal pointed away from
